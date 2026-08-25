@@ -195,6 +195,17 @@ $("personForm").onsubmit=async e=>{
 };
 
 $("quickDate").value=toISO(new Date());$("quickTime").value="17:00";
-supabase.auth.onAuthStateChange((_event,session)=>{if(!session && !ui.auth.classList.contains("hidden"))return;if(!session)location.reload()});
+supabase.auth.onAuthStateChange((_event, session) => {
+  if (!session) {
+    currentUser = null;
+    household = null;
+    people = [];
+    rawEvents = [];
+    showScreen("auth");
+    return;
+  }
+
+  currentUser = session.user;
+});
 if("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js").catch(console.warn);
 bootstrap();
