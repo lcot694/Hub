@@ -6,7 +6,11 @@ if (!cfg.SUPABASE_URL || cfg.SUPABASE_URL.includes("PASTE_")) {
     `<div class="auth-card"><h2>Setup required</h2><p>Open <strong>README.txt</strong> and complete the Supabase setup, then add your project values to <strong>config.js</strong>.</p></div>`;
   throw new Error("Supabase config missing");
 }
-const supabase = createClient(cfg.SUPABASE_URL, cfg.SUPABASE_PUBLISHABLE_KEY);
+const cleanSupabaseUrl = cfg.SUPABASE_URL
+  .replace(/\/rest\/v1\/?$/, "")
+  .replace(/\/auth\/v1\/?$/, "");
+
+const supabase = createClient(cleanSupabaseUrl, cfg.SUPABASE_PUBLISHABLE_KEY);
 
 const $ = id => document.getElementById(id);
 const ui = {
