@@ -157,7 +157,7 @@ function eventCard(e){
 
   return el;
 }
-}
+
 function renderWeek(){
   const start=startOfWeek(cursor),end=addDays(start,6);
   $("rangeLabel").textContent=`${new Intl.DateTimeFormat("en-CA",{month:"short",day:"numeric"}).format(start)} – ${new Intl.DateTimeFormat("en-CA",{month:"short",day:"numeric",year:"numeric"}).format(end)}`;
