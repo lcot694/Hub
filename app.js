@@ -20,6 +20,7 @@ let authMode = "signin";
 let currentUser = null, household = null, people = [], rawEvents = [], view = "week";
 let cursor = new Date();
 let realtimeChannel = null;
+let editingEventId = null;
 
 function showScreen(name){
   Object.values(ui).forEach(x=>x.classList.add("hidden"));
@@ -129,11 +130,33 @@ function renderLegend(){
   people.forEach(p=>{const c=document.createElement("span");c.className="person-chip";c.innerHTML=`<span class="dot" style="background:${p.color}"></span>`;c.append(document.createTextNode(p.name));el.appendChild(c)});
 }
 function eventCard(e){
-  const p=getPerson(e.person_id),el=document.createElement("div");el.className="event";el.style.setProperty("--event-color",p.color);
-  el.innerHTML=`<button class="event-delete">×</button><div class="event-time">${fmtTime(e.start_time)}${e.end_time?" – "+fmtTime(e.end_time):""}${e.recurrence!=="none"?" ↻":""}</div><div class="event-title"></div><div class="event-person"></div>`;
-  el.querySelector(".event-title").textContent=e.title;el.querySelector(".event-person").textContent=p.name;
-  el.querySelector(".event-delete").onclick=async ev=>{ev.stopPropagation();if(confirm(`Delete "${e.title}"${e.recurrence!=="none"?" and its repeating series":""}?`)){await supabase.from("events").delete().eq("id",e.id)}};
+  const p=getPerson(e.person_id),el=document.createElement("div");
+
+  el.className="event";
+  el.style.setProperty("--event-color",p.color);
+  el.style.cursor="pointer";
+  el.title="Click to edit";
+
+  el.innerHTML=`
+    <div class="event-time">
+      ${fmtTime(e.start_time)}
+      ${e.end_time ? " – "+fmtTime(e.end_time) : ""}
+      ${e.recurrence!=="none" ? " ↻" : ""}
+    </div>
+    <div class="event-title"></div>
+    <div class="event-person"></div>
+  `;
+
+  el.querySelector(".event-title").textContent=e.title;
+  el.querySelector(".event-person").textContent=p.name;
+
+  el.onclick=ev=>{
+    ev.stopPropagation();
+    openEdit(e);
+  };
+
   return el;
+}
 }
 function renderWeek(){
   const start=startOfWeek(cursor),end=addDays(start,6);
@@ -154,12 +177,25 @@ function renderMonth(){
   const y=cursor.getFullYear(),m=cursor.getMonth(),start=startOfWeek(new Date(y,m,1));$("rangeLabel").textContent=new Intl.DateTimeFormat("en-CA",{month:"long",year:"numeric"}).format(cursor);
   const wrap=document.createElement("div");wrap.className="month";["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].forEach(x=>{const h=document.createElement("div");h.className="month-head";h.textContent=x;wrap.appendChild(h)});
   for(let i=0;i<42;i++){const d=addDays(start,i),cell=document.createElement("div");cell.className="month-day"+(d.getMonth()!==m?" outside":"")+(sameDay(d,new Date())?" today":"");cell.innerHTML=`<div class="month-num">${d.getDate()}</div>`;
-    const es=eventsFor(d);es.slice(0,3).forEach(e=>{const p=getPerson(e.person_id),x=document.createElement("div");x.className="month-event";x.style.setProperty("--event-color",p.color);x.textContent=`${fmtTime(e.start_time)} ${e.title}`;cell.appendChild(x)});if(es.length>3)cell.insertAdjacentHTML("beforeend",`<div class="empty">+${es.length-3} more</div>`);cell.onclick=()=>{cursor=d;view="day";render()};wrap.appendChild(cell)}
+    const es=eventsFor(d);es.slice(0,3).forEach(e=>{const p=getPerson(e.person_id),x=document.createElement("div");x.className="month-event";x.style.setProperty("--event-color",p.color);x.textContent=`${fmtTime(e.start_time)} ${e.title}`;
+x.style.cursor="pointer";
+x.title="Click to edit";
+
+x.onclick=ev=>{
+  ev.stopPropagation();
+  openEdit(e);
+};
+
+cell.appendChild(x)});if(es.length>3)cell.insertAdjacentHTML("beforeend",`<div class="empty">+${es.length-3} more</div>`);cell.onclick=()=>{cursor=d;view="day";render()};wrap.appendChild(cell)}
   $("calendar").replaceChildren(wrap);
 }
 function renderToday(){
   const el=$("todayList");el.innerHTML="";const es=eventsFor(new Date());if(!es.length){el.innerHTML='<div class="empty">Nothing scheduled today.</div>';return}
-  es.forEach(e=>{const p=getPerson(e.person_id),row=document.createElement("div");row.className="today-row";row.innerHTML=`<div class="today-time">${fmtTime(e.start_time)}</div><div><div class="today-name"></div><div class="event-person"><span class="dot" style="background:${p.color};margin-right:5px"></span>${p.name}</div></div>`;row.querySelector(".today-name").textContent=e.title;el.appendChild(row)})
+  es.forEach(e=>{const p=getPerson(e.person_id),row=document.createElement("div");row.className="today-row";row.innerHTML=`<div class="today-time">${fmtTime(e.start_time)}</div><div><div class="today-name"></div><div class="event-person"><span class="dot" style="background:${p.color};margin-right:5px"></span>${p.name}</div></div>`;row.querySelector(".today-name").textContent=e.title;
+row.style.cursor="pointer";
+row.title="Click to edit";
+row.onclick=()=>openEdit(e);
+el.appendChild(row)})
 }
 function renderPeople(){
   const box=$("peopleSettings");box.innerHTML="";
@@ -171,8 +207,103 @@ function render(){
   document.querySelectorAll(".view-switch button").forEach(b=>b.classList.toggle("active",b.dataset.view===view));
   if(view==="day")renderDay();else if(view==="month")renderMonth();else renderWeek();
 }
+function ensureEditButton(){
+  const actions=$("eventDialog").querySelector(".modal-actions");
+
+  if(!$("deleteEventBtn")){
+    const btn=document.createElement("button");
+    btn.id="deleteEventBtn";
+    btn.type="button";
+    btn.className="btn danger";
+    btn.textContent="Delete event";
+
+    btn.onclick=async()=>{
+      if(!editingEventId)return;
+
+      const current=rawEvents.find(e=>e.id===editingEventId);
+
+      const recurring=current?.recurrence!=="none"
+        ? " This will delete the entire repeating series."
+        : "";
+
+      if(!confirm(`Delete "${current?.title}"?${recurring}`))return;
+
+      setSync("Deleting…",false);
+
+      const {error}=await supabase
+        .from("events")
+        .delete()
+        .eq("id",editingEventId);
+
+      if(error){
+        alert(error.message);
+        setSync("Delete error",false);
+        return;
+      }
+
+      editingEventId=null;
+      $("eventDialog").close();
+    };
+
+    actions.prepend(btn);
+  }
+}
+
+function setEventDialogMode(mode){
+  ensureEditButton();
+
+  const heading=$("eventDialog").querySelector("h2");
+  const saveButton=$("eventForm").querySelector('button[type="submit"]');
+  const deleteButton=$("deleteEventBtn");
+
+  if(mode==="edit"){
+    heading.textContent="Edit event";
+    saveButton.textContent="Save changes";
+    deleteButton.classList.remove("hidden");
+  }else{
+    heading.textContent="Add family event";
+    saveButton.textContent="Save event";
+    deleteButton.classList.add("hidden");
+  }
+}
+
 function openAdd(d=new Date()){
-  $("eventTitle").value="";$("eventDate").value=toISO(d);$("eventTime").value="17:00";$("eventEndTime").value="";$("eventRepeat").value="none";$("eventRepeatEnd").value="";$("repeatEndWrap").classList.add("hidden");$("eventDialog").showModal()
+  editingEventId=null;
+  setEventDialogMode("add");
+
+  $("eventTitle").value="";
+  $("eventDate").value=toISO(d);
+  $("eventTime").value="17:00";
+  $("eventEndTime").value="";
+  $("eventRepeat").value="none";
+  $("eventRepeatEnd").value="";
+  $("repeatEndWrap").classList.add("hidden");
+
+  if(people.length){
+    $("eventPerson").value=people[0].id;
+  }
+
+  $("eventDialog").showModal();
+}
+
+function openEdit(e){
+  editingEventId=e.id;
+  setEventDialogMode("edit");
+
+  $("eventTitle").value=e.title || "";
+  $("eventPerson").value=e.person_id || "";
+  $("eventDate").value=e.event_date;
+  $("eventTime").value=(e.start_time || "").slice(0,5);
+  $("eventEndTime").value=(e.end_time || "").slice(0,5);
+  $("eventRepeat").value=e.recurrence || "none";
+  $("eventRepeatEnd").value=e.recurrence_end || "";
+
+  $("repeatEndWrap").classList.toggle(
+    "hidden",
+    (e.recurrence || "none")==="none"
+  );
+
+  $("eventDialog").showModal();
 }
 document.querySelectorAll("[data-close]").forEach(b=>b.onclick=()=>$(b.dataset.close).close());
 document.querySelectorAll(".view-switch button").forEach(b=>b.onclick=()=>{view=b.dataset.view;render()});
@@ -185,9 +316,48 @@ $("shareBtn").onclick=()=>{$("shareCode").textContent=household.join_code;$("sha
 $("copyCodeBtn").onclick=async()=>{await navigator.clipboard.writeText(household.join_code);$("copyCodeBtn").textContent="Copied!";setTimeout(()=>$("copyCodeBtn").textContent="Copy code",1200)};
 $("eventRepeat").onchange=()=>{$("repeatEndWrap").classList.toggle("hidden",$("eventRepeat").value==="none")};
 $("eventForm").onsubmit=async e=>{
-  e.preventDefault();setSync("Saving…",false);
-  const payload={household_id:household.id,person_id:$("eventPerson").value||null,title:$("eventTitle").value.trim(),event_date:$("eventDate").value,start_time:$("eventTime").value||null,end_time:$("eventEndTime").value||null,recurrence:$("eventRepeat").value,recurrence_end:$("eventRepeat").value==="none"?null:($("eventRepeatEnd").value||null),created_by:currentUser.id};
-  const {error}=await supabase.from("events").insert(payload);if(error){alert(error.message);setSync("Save error",false);return}$("eventDialog").close()
+  e.preventDefault();
+
+  setSync(editingEventId ? "Updating…" : "Saving…",false);
+
+  const payload={
+    household_id:household.id,
+    person_id:$("eventPerson").value||null,
+    title:$("eventTitle").value.trim(),
+    event_date:$("eventDate").value,
+    start_time:$("eventTime").value||null,
+    end_time:$("eventEndTime").value||null,
+    recurrence:$("eventRepeat").value,
+    recurrence_end:
+      $("eventRepeat").value==="none"
+        ? null
+        : ($("eventRepeatEnd").value||null)
+  };
+
+  let result;
+
+  if(editingEventId){
+    result=await supabase
+      .from("events")
+      .update(payload)
+      .eq("id",editingEventId);
+  }else{
+    result=await supabase
+      .from("events")
+      .insert({
+        ...payload,
+        created_by:currentUser.id
+      });
+  }
+
+  if(result.error){
+    alert(result.error.message);
+    setSync(editingEventId ? "Update error" : "Save error",false);
+    return;
+  }
+
+  editingEventId=null;
+  $("eventDialog").close();
 };
 $("quickForm").onsubmit=async e=>{
   e.preventDefault();const {error}=await supabase.from("events").insert({household_id:household.id,person_id:$("quickPerson").value||null,title:$("quickTitle").value.trim(),event_date:$("quickDate").value,start_time:$("quickTime").value||null,recurrence:"none",created_by:currentUser.id});
