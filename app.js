@@ -1,4 +1,5 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { toISO, parseISO, occursOn, eventsFor } from "./lib/calendar-domain.js";
 
 const cfg = window.FAMILY_HUB_CONFIG || {};
 if (!cfg.SUPABASE_URL || cfg.SUPABASE_URL.includes("PASTE_")) {
@@ -30,25 +31,12 @@ function msg(el,text,good=false){
   el.textContent=text; el.classList.remove("hidden");
   el.style.background = good ? "#eef8f1" : "#fff2f2";
 }
-function toISO(d){return new Date(d.getFullYear(),d.getMonth(),d.getDate()).toLocaleDateString("en-CA")}
-function parseISO(s){const [y,m,d]=s.split("-").map(Number);return new Date(y,m-1,d)}
 function addDays(d,n){const x=new Date(d);x.setDate(x.getDate()+n);return x}
 function startOfWeek(d){const x=new Date(d);x.setDate(x.getDate()-x.getDay());x.setHours(0,0,0,0);return x}
 function sameDay(a,b){return toISO(a)===toISO(b)}
 function fmtDate(d,o={weekday:"long",month:"long",day:"numeric"}){return new Intl.DateTimeFormat("en-CA",o).format(d)}
 function fmtTime(t){if(!t)return"";const[h,m]=t.split(":").map(Number);return new Intl.DateTimeFormat("en-CA",{hour:"numeric",minute:"2-digit"}).format(new Date(2000,0,1,h,m))}
 function getPerson(id){return people.find(p=>p.id===id)||{name:"Family",color:"#777"}}
-function occursOn(e,date){
-  const d=toISO(date);
-  if(e.recurrence==="none") return e.event_date===d;
-  if(d < e.event_date) return false;
-  if(e.recurrence_end && d > e.recurrence_end) return false;
-  const start=parseISO(e.event_date);
-  const diff=Math.round((date-start)/86400000);
-  return e.recurrence==="daily" ? diff>=0 : e.recurrence==="weekly" ? diff>=0 && diff%7===0 : false;
-}
-function eventsFor(date){return rawEvents.filter(e=>occursOn(e,date)).sort((a,b)=>(a.start_time||"").localeCompare(b.start_time||""))}
-
 async function bootstrap(){
   const {data:{session}}=await supabase.auth.getSession();
   if(!session){showScreen("auth");return}
@@ -164,20 +152,20 @@ function renderWeek(){
   const wrap=document.createElement("div");wrap.className="week";
   for(let i=0;i<7;i++){const d=addDays(start,i),col=document.createElement("div");col.className="daycol"+(sameDay(d,new Date())?" today":"");
     col.innerHTML=`<div class="dayhead"><span class="dow">${new Intl.DateTimeFormat("en-CA",{weekday:"short"}).format(d)}</span><span class="dom">${d.getDate()}</span></div><div class="events"></div>`;
-    const holder=col.querySelector(".events"),es=eventsFor(d);if(!es.length)holder.innerHTML='<div class="empty">No events</div>';es.forEach(x=>holder.appendChild(eventCard(x)));col.ondblclick=()=>openAdd(d);wrap.appendChild(col)}
+    const holder=col.querySelector(".events"),es=eventsFor(rawEvents,d);if(!es.length)holder.innerHTML='<div class="empty">No events</div>';es.forEach(x=>holder.appendChild(eventCard(x)));col.ondblclick=()=>openAdd(d);wrap.appendChild(col)}
   $("calendar").replaceChildren(wrap);
 }
 function renderDay(){
   $("rangeLabel").textContent=fmtDate(cursor);const wrap=document.createElement("div");wrap.className="day-view";
   people.forEach(p=>{const col=document.createElement("div");col.className="person-column";col.innerHTML=`<h3><span class="dot" style="background:${p.color}"></span>${p.name}</h3>`;
-    const es=eventsFor(cursor).filter(e=>e.person_id===p.id);if(!es.length)col.insertAdjacentHTML("beforeend",'<div class="empty">Nothing scheduled</div>');es.forEach(e=>col.appendChild(eventCard(e)));wrap.appendChild(col)});
+    const es=eventsFor(rawEvents,cursor).filter(e=>e.person_id===p.id);if(!es.length)col.insertAdjacentHTML("beforeend",'<div class="empty">Nothing scheduled</div>');es.forEach(e=>col.appendChild(eventCard(e)));wrap.appendChild(col)});
   $("calendar").replaceChildren(wrap);
 }
 function renderMonth(){
   const y=cursor.getFullYear(),m=cursor.getMonth(),start=startOfWeek(new Date(y,m,1));$("rangeLabel").textContent=new Intl.DateTimeFormat("en-CA",{month:"long",year:"numeric"}).format(cursor);
   const wrap=document.createElement("div");wrap.className="month";["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].forEach(x=>{const h=document.createElement("div");h.className="month-head";h.textContent=x;wrap.appendChild(h)});
   for(let i=0;i<42;i++){const d=addDays(start,i),cell=document.createElement("div");cell.className="month-day"+(d.getMonth()!==m?" outside":"")+(sameDay(d,new Date())?" today":"");cell.innerHTML=`<div class="month-num">${d.getDate()}</div>`;
-    const es=eventsFor(d);es.slice(0,3).forEach(e=>{const p=getPerson(e.person_id),x=document.createElement("div");x.className="month-event";x.style.setProperty("--event-color",p.color);x.textContent=`${fmtTime(e.start_time)} ${e.title}`;
+    const es=eventsFor(rawEvents,d);es.slice(0,3).forEach(e=>{const p=getPerson(e.person_id),x=document.createElement("div");x.className="month-event";x.style.setProperty("--event-color",p.color);x.textContent=`${fmtTime(e.start_time)} ${e.title}`;
 x.style.cursor="pointer";
 x.title="Click to edit";
 
@@ -190,7 +178,7 @@ cell.appendChild(x)});if(es.length>3)cell.insertAdjacentHTML("beforeend",`<div c
   $("calendar").replaceChildren(wrap);
 }
 function renderToday(){
-  const el=$("todayList");el.innerHTML="";const es=eventsFor(new Date());if(!es.length){el.innerHTML='<div class="empty">Nothing scheduled today.</div>';return}
+  const el=$("todayList");el.innerHTML="";const es=eventsFor(rawEvents,new Date());if(!es.length){el.innerHTML='<div class="empty">Nothing scheduled today.</div>';return}
   es.forEach(e=>{const p=getPerson(e.person_id),row=document.createElement("div");row.className="today-row";row.innerHTML=`<div class="today-time">${fmtTime(e.start_time)}</div><div><div class="today-name"></div><div class="event-person"><span class="dot" style="background:${p.color};margin-right:5px"></span>${p.name}</div></div>`;row.querySelector(".today-name").textContent=e.title;
 row.style.cursor="pointer";
 row.title="Click to edit";
