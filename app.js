@@ -1,5 +1,6 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { toISO, parseISO, occursOn, eventsFor } from "./lib/calendar-domain.js";
+import { createGoogleSettings } from "./lib/google-ui.js";
 
 const cfg = window.FAMILY_HUB_CONFIG || {};
 if (!cfg.SUPABASE_URL || cfg.SUPABASE_URL.includes("PASTE_")) {
@@ -55,6 +56,10 @@ async function loadHousehold(){
   subscribeRealtime();
   showScreen("app");
   render();
+  if(new URLSearchParams(location.search).get("google")==="connected"){
+    googleSettings.load();
+    history.replaceState({},"",location.pathname);
+  }
 }
 async function loadData(){
   setSync("Syncing…",false);
@@ -105,6 +110,12 @@ $("joinHouseholdForm").onsubmit=async e=>{
 };
 $("householdSignout").onclick=()=>supabase.auth.signOut().then(()=>location.reload());
 $("signoutBtn").onclick=()=>supabase.auth.signOut().then(()=>location.reload());
+const googleSettings=createGoogleSettings({
+  supabase,
+  root:$("googleSettings"),
+  getContext:()=>({householdId:household?.id,people}),
+  onChanged:()=>{}
+});
 
 function fillPersonSelects(){
   ["quickPerson","eventPerson"].forEach(id=>{
@@ -299,7 +310,7 @@ $("todayBtn").onclick=()=>{cursor=new Date();render()};
 $("prevBtn").onclick=()=>{cursor=view==="month"?new Date(cursor.getFullYear(),cursor.getMonth()-1,1):addDays(cursor,view==="week"?-7:-1);render()};
 $("nextBtn").onclick=()=>{cursor=view==="month"?new Date(cursor.getFullYear(),cursor.getMonth()+1,1):addDays(cursor,view==="week"?7:1);render()};
 $("addBtn").onclick=()=>openAdd(cursor);
-$("familyBtn").onclick=()=>{renderPeople();$("familyDialog").showModal()};
+$("familyBtn").onclick=()=>{renderPeople();googleSettings.load();$("familyDialog").showModal()};
 $("shareBtn").onclick=()=>{$("shareCode").textContent=household.join_code;$("shareDialog").showModal()};
 $("copyCodeBtn").onclick=async()=>{await navigator.clipboard.writeText(household.join_code);$("copyCodeBtn").textContent="Copied!";setTimeout(()=>$("copyCodeBtn").textContent="Copy code",1200)};
 $("eventRepeat").onchange=()=>{$("repeatEndWrap").classList.toggle("hidden",$("eventRepeat").value==="none")};

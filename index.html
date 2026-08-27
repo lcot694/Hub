@@ -141,6 +141,16 @@
       <h2>Family members</h2>
       <div id="peopleSettings" class="settings-people"></div>
       <button id="addPersonBtn" class="btn wide">+ Add family member</button>
+      <section id="googleSettings" class="google-settings" aria-labelledby="googleSettingsTitle">
+        <h3 id="googleSettingsTitle">Google Calendar</h3>
+        <label>Family member<select id="googlePerson"></select></label>
+        <div id="googleCalendarList" class="google-calendar-list" aria-live="polite"></div>
+        <div class="google-settings-actions">
+          <button id="googleConnectBtn" class="btn" type="button">Connect Google Calendar</button>
+          <button id="googleSyncNowBtn" class="btn hidden" type="button">Sync now</button>
+          <button id="googleDisconnectBtn" class="btn danger hidden" type="button">Disconnect</button>
+        </div>
+      </section>
       <div class="modal-actions">
         <button class="btn" type="button" data-close="familyDialog">Close</button>
         <button id="signoutBtn" class="btn danger" type="button">Sign out</button>
