@@ -132,9 +132,9 @@ test("controller renders loading, disconnected, and reconnect states", async () 
 
   const disconnected = settings.load();
   assert.match(root.querySelector("#googleCalendarList").textContent, /Loading/);
-  responses.shift()({ data: { connection: null, calendars: [] }, error: null });
+  responses.shift()({ data: { connection: { state: "disconnected" }, calendars: [] }, error: null });
   await disconnected;
-  assert.match(root.querySelector("#googleCalendarList").textContent, /Connect a Google account/);
+  assert.match(root.querySelector("#googleCalendarList").textContent, /This Google account is disconnected/);
 
   const reconnect = settings.load();
   responses.shift()({ data: { connection: { state: "reconnect_required", personId: "person", displayEmail: null }, calendars: [] }, error: null });
@@ -205,6 +205,7 @@ test("controls stay disabled until every overlapping operation settles", async (
   fixture.requests[2].resolve({ data: activeModel("newest-load"), error: null });
   await loading;
   assert.equal(controlsAreDisabled(fixture.root), true);
+  assert.equal(calendarCheckbox(fixture.root).disabled, true);
   fixture.requests[1].resolve({ data: activeModel("stale-save"), error: null });
   await saving;
   assert.equal(controlsAreDisabled(fixture.root), false);
