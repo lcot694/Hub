@@ -279,7 +279,9 @@ begin
     where e.id = p_family_event_id
       and public.is_household_member(e.household_id)
   ) then
-    raise exception 'Google-backed event is not available to this user';
+    raise exception using
+      errcode = '42501',
+      message = 'google_event_forbidden';
   end if;
 
   if exists (
@@ -289,7 +291,9 @@ begin
     where m.family_event_id = p_family_event_id
       and not cal.is_writable
   ) then
-    raise exception 'Google calendar is read only';
+    raise exception using
+      errcode = '42501',
+      message = 'google_calendar_read_only';
   end if;
 end;
 $$;
@@ -304,6 +308,7 @@ security definer
 set search_path = public
 as $$
 declare
+  v_locked_event_id uuid;
   v_mapping_id uuid;
   v_processing_id uuid;
   v_processing_operation text;
@@ -311,6 +316,15 @@ declare
 begin
   if p_operation not in ('create','update','delete') then
     raise exception 'Unsupported Google sync operation';
+  end if;
+
+  select e.id into v_locked_event_id
+  from public.events e
+  where e.id = p_family_event_id
+  for update of e;
+
+  if v_locked_event_id is null then
+    return null;
   end if;
 
   select m.id into v_mapping_id
@@ -385,6 +399,12 @@ begin
     return new;
   end if;
 
+  -- save_google_backed_event locks and enqueues explicitly so an edit cannot
+  -- race its mapping validation with this general-purpose trigger.
+  if current_setting('app.skip_google_event_queue', true) = 'on' then
+    return new;
+  end if;
+
   if tg_op = 'INSERT' then
     perform public.assert_google_event_change_allowed(new.id);
     perform public.enqueue_google_event_change_internal(new.id, 'create');
@@ -407,23 +427,247 @@ create trigger events_enqueue_google_change
 after insert or update on public.events
 for each row execute function public.events_enqueue_google_change();
 
+create or replace function public.save_google_backed_event(p_event jsonb)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_household_id uuid;
+  v_calendar_id uuid;
+  v_event_id uuid;
+  v_person_id uuid;
+  v_connection_id uuid;
+  v_title text;
+  v_event_date date;
+  v_start_time time;
+  v_end_time time;
+  v_all_day boolean;
+  v_recurrence text;
+  v_recurrence_end date;
+  v_existing_event public.events%rowtype;
+  v_mapping public.google_event_mappings%rowtype;
+  v_google_changed boolean := false;
+begin
+  if auth.uid() is null then
+    raise exception using
+      errcode = '42501',
+      message = 'google_event_not_authenticated';
+  end if;
+
+  if jsonb_typeof(p_event) <> 'object'
+    or jsonb_typeof(p_event->'household_id') <> 'string'
+    or jsonb_typeof(p_event->'google_calendar_id') <> 'string'
+    or (p_event ? 'id' and jsonb_typeof(p_event->'id') <> 'string')
+    or (p_event ? 'person_id' and jsonb_typeof(p_event->'person_id') not in ('string', 'null'))
+    or (p_event ? 'title' and jsonb_typeof(p_event->'title') <> 'string')
+    or jsonb_typeof(p_event->'event_date') <> 'string'
+    or (p_event ? 'start_time' and jsonb_typeof(p_event->'start_time') not in ('string', 'null'))
+    or (p_event ? 'end_time' and jsonb_typeof(p_event->'end_time') not in ('string', 'null'))
+    or (p_event ? 'all_day' and jsonb_typeof(p_event->'all_day') <> 'boolean')
+    or (p_event ? 'recurrence' and jsonb_typeof(p_event->'recurrence') <> 'string')
+    or (p_event ? 'recurrence_end' and jsonb_typeof(p_event->'recurrence_end') not in ('string', 'null')) then
+    raise exception using
+      errcode = '22023',
+      message = 'google_event_invalid_payload';
+  end if;
+
+  begin
+    v_household_id := (p_event->>'household_id')::uuid;
+    v_calendar_id := (p_event->>'google_calendar_id')::uuid;
+    v_event_id := nullif(p_event->>'id', '')::uuid;
+    v_person_id := nullif(p_event->>'person_id', '')::uuid;
+    v_event_date := (p_event->>'event_date')::date;
+    v_start_time := nullif(p_event->>'start_time', '')::time;
+    v_end_time := nullif(p_event->>'end_time', '')::time;
+    v_all_day := coalesce((p_event->>'all_day')::boolean, false);
+    v_recurrence := coalesce(p_event->>'recurrence', 'none');
+    v_recurrence_end := nullif(p_event->>'recurrence_end', '')::date;
+  exception when invalid_text_representation or datetime_field_overflow then
+    raise exception using
+      errcode = '22023',
+      message = 'google_event_invalid_payload';
+  end;
+
+  v_title := btrim(coalesce(p_event->>'title', ''));
+  if v_title = ''
+    or v_recurrence not in ('none', 'daily', 'weekly', 'monthly', 'yearly') then
+    raise exception using
+      errcode = '22023',
+      message = 'google_event_invalid_payload';
+  end if;
+
+  if not public.is_household_member(v_household_id) then
+    raise exception using
+      errcode = '42501',
+      message = 'google_event_forbidden';
+  end if;
+
+  if v_person_id is not null and not exists (
+    select 1
+    from public.people p
+    where p.id = v_person_id
+      and p.household_id = v_household_id
+  ) then
+    raise exception using
+      errcode = '22023',
+      message = 'google_event_invalid_person';
+  end if;
+
+  select c.id into v_connection_id
+  from public.google_connections c
+  join public.google_calendars cal on cal.google_connection_id = c.id
+  where cal.id = v_calendar_id
+    and c.user_id = auth.uid()
+    and c.household_id = v_household_id
+    and c.connection_state = 'active'
+    and cal.enabled and cal.is_writable
+  for update of c, cal;
+
+  if v_connection_id is null then
+    raise exception using
+      errcode = '42501',
+      message = 'google_event_destination_unavailable';
+  end if;
+
+  if v_event_id is null then
+    insert into public.events (
+      household_id, person_id, title, event_date, start_time, end_time,
+      all_day, recurrence, recurrence_end, created_by
+    ) values (
+      v_household_id, v_person_id, v_title, v_event_date, v_start_time, v_end_time,
+      v_all_day, v_recurrence, v_recurrence_end, auth.uid()
+    ) returning id into v_event_id;
+
+    insert into public.google_event_mappings (
+      family_event_id, google_connection_id, google_calendar_id, google_event_id, sync_state
+    ) values (
+      v_event_id, v_connection_id, v_calendar_id,
+      'fh' || replace(v_event_id::text, '-', ''), 'syncing'
+    );
+
+    perform public.enqueue_google_event_change_internal(v_event_id, 'create');
+    return v_event_id;
+  end if;
+
+  select e.* into v_existing_event
+  from public.events e
+  where e.id = v_event_id
+    and e.household_id = v_household_id
+  for update of e;
+
+  if not found then
+    raise exception using
+      errcode = 'P0002',
+      message = 'google_event_not_found';
+  end if;
+
+  select m.* into v_mapping
+  from public.google_event_mappings m
+  where m.family_event_id = v_event_id
+  for update of m;
+
+  if not found
+    or v_mapping.google_connection_id <> v_connection_id
+    or v_mapping.google_calendar_id <> v_calendar_id then
+    raise exception using
+      errcode = '42501',
+      message = 'google_event_destination_unavailable';
+  end if;
+
+  v_google_changed := v_existing_event.title is distinct from v_title
+    or v_existing_event.event_date is distinct from v_event_date
+    or v_existing_event.start_time is distinct from v_start_time
+    or v_existing_event.end_time is distinct from v_end_time
+    or v_existing_event.all_day is distinct from v_all_day
+    or v_existing_event.recurrence is distinct from v_recurrence
+    or v_existing_event.recurrence_end is distinct from v_recurrence_end;
+
+  perform set_config('app.skip_google_event_queue', 'on', true);
+  update public.events
+  set person_id = v_person_id,
+      title = v_title,
+      event_date = v_event_date,
+      start_time = v_start_time,
+      end_time = v_end_time,
+      all_day = v_all_day,
+      recurrence = v_recurrence,
+      recurrence_end = v_recurrence_end
+  where id = v_event_id;
+
+  if v_google_changed then
+    perform public.enqueue_google_event_change_internal(v_event_id, 'update');
+  end if;
+
+  return v_event_id;
+end;
+$$;
+
 create or replace function public.request_google_event_delete(p_family_event_id uuid)
 returns void
 language plpgsql
 security definer
 set search_path = public
 as $$
+declare
+  v_event public.events%rowtype;
+  v_mapping public.google_event_mappings%rowtype;
+  v_pending_create_id uuid;
 begin
+  if auth.uid() is null then
+    raise exception using
+      errcode = '42501',
+      message = 'google_event_not_authenticated';
+  end if;
+
+  -- Keep the trigger/RPC authorization boundary shared, then apply the
+  -- stricter caller-owned active-connection check below.
   perform public.assert_google_event_change_allowed(p_family_event_id);
 
-  if not exists (
-    select 1
-    from public.google_event_mappings m
-    join public.events e on e.id = m.family_event_id
-    where m.family_event_id = p_family_event_id
-      and public.is_household_member(e.household_id)
-  ) then
-    raise exception 'Google-backed event is not available to this user';
+  select e.* into v_event
+  from public.events e
+  where e.id = p_family_event_id
+    and public.is_household_member(e.household_id)
+  for update of e;
+
+  if not found then
+    raise exception using
+      errcode = '42501',
+      message = 'google_event_forbidden';
+  end if;
+
+  select m.* into v_mapping
+  from public.google_event_mappings m
+  join public.google_connections c on c.id = m.google_connection_id
+  join public.google_calendars cal on cal.id = m.google_calendar_id
+  where m.family_event_id = p_family_event_id
+    and c.user_id = auth.uid()
+    and c.connection_state = 'active'
+    and cal.enabled and cal.is_writable
+  for update of m, c, cal;
+
+  if not found then
+    raise exception using
+      errcode = '42501',
+      message = 'google_event_destination_unavailable';
+  end if;
+
+  select q.id into v_pending_create_id
+  from public.google_sync_queue q
+  where q.family_event_id = p_family_event_id
+    and q.google_event_mapping_id = v_mapping.id
+    and q.status = 'pending'
+    and q.operation = 'create'
+  for update;
+
+  if v_pending_create_id is not null then
+    -- Google has not seen this event, so cancelling the local creation is
+    -- safer than sending a delete for an event that does not exist remotely.
+    delete from public.google_sync_queue where id = v_pending_create_id;
+    delete from public.google_event_mappings where id = v_mapping.id;
+    delete from public.events where id = p_family_event_id;
+    return;
   end if;
 
   update public.events
@@ -581,6 +825,7 @@ revoke all on function public.set_google_calendar_enabled(uuid, boolean) from pu
 revoke all on function public.assert_google_event_change_allowed(uuid) from public, anon, authenticated, service_role;
 revoke all on function public.enqueue_google_event_change_internal(uuid, text) from public, anon, authenticated, service_role;
 revoke all on function public.enqueue_google_event_change(uuid, text) from public, anon, authenticated, service_role;
+revoke all on function public.save_google_backed_event(jsonb) from public, anon, authenticated, service_role;
 revoke all on function public.request_google_event_delete(uuid) from public, anon, authenticated, service_role;
 revoke all on function public.has_google_event_mapping(uuid) from public, anon, authenticated, service_role;
 revoke all on function public.claim_google_sync_jobs(integer, integer) from public, anon, authenticated, service_role;
@@ -589,6 +834,7 @@ revoke all on function public.fail_google_sync_job(uuid, uuid, text, text, times
 
 grant execute on function public.get_google_sync_status() to authenticated;
 grant execute on function public.set_google_calendar_enabled(uuid, boolean) to authenticated;
+grant execute on function public.save_google_backed_event(jsonb) to authenticated;
 grant execute on function public.request_google_event_delete(uuid) to authenticated;
 grant execute on function public.has_google_event_mapping(uuid) to authenticated;
 grant execute on function public.enqueue_google_event_change(uuid, text) to service_role;
