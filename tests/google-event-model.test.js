@@ -128,6 +128,27 @@ test("same-zone recurring events remain writable across daylight-saving time", (
   assert.equal(result.event.recurrence, "weekly");
 });
 
+test("a recurring event with mismatched endpoint zones is read-only", () => {
+  const result = googleToFamilyEvent({
+    id:"g7b", summary:"Mixed-zone series",
+    start:{ dateTime:"2026-03-08T09:00:00-04:00", timeZone:"America/Toronto" },
+    end:{ dateTime:"2026-03-08T10:00:00-07:00", timeZone:"America/Los_Angeles" },
+    recurrence:["RRULE:FREQ=WEEKLY"]
+  }, context);
+
+  assert.deepEqual(result, { supported:false, readOnlyReason:"recurring_time_zone_mismatch" });
+});
+
+test("fall-back fold events are read-only when local end time precedes local start time", () => {
+  const result = googleToFamilyEvent({
+    id:"g7c", summary:"Fall-back fold",
+    start:{ dateTime:"2026-11-01T01:45:00-04:00", timeZone:"America/Toronto" },
+    end:{ dateTime:"2026-11-01T01:15:00-05:00", timeZone:"America/Toronto" }
+  }, context);
+
+  assert.deepEqual(result, { supported:false, readOnlyReason:"ambiguous_local_time" });
+});
+
 test("multi-day Google events are read-only because Family Hub has no end date", () => {
   const allDay = googleToFamilyEvent({
     id:"g8", start:{ date:"2026-09-01" }, end:{ date:"2026-09-03" }
