@@ -1,5 +1,10 @@
-import { familyToGoogleEvent } from "../../../lib/google-event-model.js";
+import { familyToGoogleEvent, googleToFamilyEvent } from "../../../lib/google-event-model.js";
 import { chooseConflictWinner, retryDecision } from "../../../lib/sync-policy.js";
+import {
+  googleFetch,
+  type GoogleClientDependencies,
+  type GoogleConnection,
+} from "./google-client.ts";
 
 export type PushOperation = "create" | "update" | "delete";
 export type PushErrorCategory =
@@ -22,6 +27,7 @@ export interface ClaimedPushJob {
 export interface FamilyPushEvent {
   id: string;
   household_id: string;
+  person_id: string | null;
   title: string;
   event_date: string;
   start_time: string | null;
@@ -95,6 +101,7 @@ export interface PushCompletion {
     safe_error_message: null;
   };
   reconcileGoogleEvent?: GooglePushEvent;
+  reconcileFamilyEvent?: Record<string, unknown>;
   /** Atomically copy the reconciled event row's updated_at into the mapping. */
   captureReconciledFamilyUpdatedAt?: true;
 }
@@ -140,6 +147,62 @@ export interface PushGoogleAdapter {
     googleCalendarId: string,
     googleEventId: string,
   ): Promise<GoogleDeleteResponse>;
+}
+
+function googleEventUrl(googleCalendarId: string, googleEventId?: string): string {
+  const base = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(googleCalendarId)}/events`;
+  return googleEventId ? `${base}/${encodeURIComponent(googleEventId)}` : base;
+}
+
+async function readGoogleEvent(response: Response): Promise<GooglePushEvent> {
+  try {
+    return await response.json() as GooglePushEvent;
+  } catch {
+    throw new GooglePushError("validation", 502);
+  }
+}
+
+/** Uses the Task 5 authenticated client; dependencies stay injectable for tests and orchestration. */
+export function createGooglePushAdapter(
+  clientDependencies: GoogleClientDependencies = {},
+): PushGoogleAdapter {
+  const request = (connection: PushConnection, input: Request) => (
+    googleFetch(connection as unknown as GoogleConnection, input, clientDependencies)
+  );
+  return {
+    async insert(connection, _calendar, googleCalendarId, googleEventId, payload) {
+      const response = await request(connection, new Request(googleEventUrl(googleCalendarId), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...payload, id: googleEventId }),
+      }));
+      return await readGoogleEvent(response);
+    },
+    async update(connection, _calendar, googleCalendarId, googleEventId, payload, options) {
+      const response = await request(connection, new Request(googleEventUrl(googleCalendarId, googleEventId), {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          "If-Match": options.ifMatch,
+        },
+        body: JSON.stringify(payload),
+      }));
+      return await readGoogleEvent(response);
+    },
+    async get(connection, _calendar, googleCalendarId, googleEventId) {
+      return await readGoogleEvent(await request(
+        connection,
+        new Request(googleEventUrl(googleCalendarId, googleEventId)),
+      ));
+    },
+    async delete(connection, _calendar, googleCalendarId, googleEventId) {
+      const response = await request(connection, new Request(googleEventUrl(googleCalendarId, googleEventId), {
+        method: "DELETE",
+      }));
+      if (response.status === 204) return { status: 204 };
+      return { status: response.status, event: await readGoogleEvent(response) };
+    },
+  };
 }
 
 export interface PushDependencies {
@@ -243,6 +306,90 @@ function assertConfirmedEvent(event: GooglePushEvent, expectedId: string): Googl
   return event;
 }
 
+interface RemoteWriteOutcome {
+  event?: GooglePushEvent;
+  conflictWinner?: PushResult["conflictWinner"];
+  finalizeLocalDelete: boolean;
+  reconcileGoogleEvent?: GooglePushEvent;
+  reconcileFamilyEvent?: Record<string, unknown>;
+}
+
+function translatedGoogleEvent(
+  context: PushContext,
+  event: GooglePushEvent,
+): Record<string, unknown> {
+  const translated = googleToFamilyEvent(event, {
+    householdId: context.familyEvent.household_id,
+    defaultPersonId: context.familyEvent.person_id,
+    householdTimeZone: context.householdTimeZone,
+  });
+  if (!translated.supported) throw new GooglePushError("validation", 409);
+  return translated.event as Record<string, unknown>;
+}
+
+async function updateAfterConflict(
+  context: PushContext,
+  dependencies: PushDependencies,
+  eventId: string,
+  payload: Record<string, unknown>,
+  etag: string,
+): Promise<GooglePushEvent> {
+  try {
+    return assertConfirmedEvent(await dependencies.google.update(
+      context.connection,
+      context.calendar,
+      context.calendar.google_calendar_id,
+      eventId,
+      payload,
+      { ifMatch: etag },
+    ), eventId);
+  } catch (error) {
+    if (statusOf(error) === 412) throw new GooglePushError("transient", 409);
+    throw error;
+  }
+}
+
+async function resolveFetchedEvent(
+  context: PushContext,
+  dependencies: PushDependencies,
+  eventId: string,
+  payload: Record<string, unknown>,
+  fetched: GooglePushEvent,
+): Promise<RemoteWriteOutcome> {
+  if (fetched?.id !== eventId) {
+    throw new GooglePushError("transient", 409);
+  }
+  if (fetched.status === "cancelled") {
+    let conflictWinner: PushResult["conflictWinner"];
+    if (typeof fetched.updated === "string" && !Number.isNaN(Date.parse(fetched.updated))) {
+      conflictWinner = chooseConflictWinner(context.mapping, context.familyEvent, fetched);
+    } else {
+      const localState = chooseConflictWinner(context.mapping, context.familyEvent, {
+        updated: context.mapping.last_google_updated_at,
+      });
+      if (localState !== "unchanged") throw new GooglePushError("transient", 409);
+      conflictWinner = "google";
+    }
+    if (conflictWinner === "family") throw new GooglePushError("transient", 409);
+    return { conflictWinner, finalizeLocalDelete: true };
+  }
+
+  const confirmed = assertConfirmedEvent(fetched, eventId);
+  const conflictWinner = chooseConflictWinner(context.mapping, context.familyEvent, confirmed);
+  const reconcileFamilyEvent = translatedGoogleEvent(context, confirmed);
+  if (conflictWinner === "family") {
+    const event = await updateAfterConflict(context, dependencies, eventId, payload, confirmed.etag);
+    return { event, conflictWinner, finalizeLocalDelete: false };
+  }
+  return {
+    event: confirmed,
+    conflictWinner,
+    finalizeLocalDelete: false,
+    reconcileGoogleEvent: confirmed,
+    reconcileFamilyEvent,
+  };
+}
+
 function mappingConfirmation(
   familyEvent: FamilyPushEvent,
   googleEvent: GooglePushEvent,
@@ -258,6 +405,28 @@ function mappingConfirmation(
   };
 }
 
+function completionForOutcome(
+  familyEvent: FamilyPushEvent,
+  outcome: RemoteWriteOutcome,
+): PushCompletion {
+  if (outcome.finalizeLocalDelete) return { finalizeLocalDelete: true };
+  if (!outcome.event) throw new GooglePushError("transient", 503);
+
+  const confirmedMapping = mappingConfirmation(familyEvent, outcome.event);
+  const { last_family_updated_at: _staleFamilyTimestamp, ...reconciledMapping } = confirmedMapping;
+  return {
+    finalizeLocalDelete: false,
+    mapping: outcome.reconcileGoogleEvent ? reconciledMapping : confirmedMapping,
+    ...(outcome.reconcileGoogleEvent
+      ? {
+        reconcileGoogleEvent: outcome.reconcileGoogleEvent,
+        reconcileFamilyEvent: outcome.reconcileFamilyEvent,
+        captureReconciledFamilyUpdatedAt: true as const,
+      }
+      : {}),
+  };
+}
+
 function googleIdFor(job: ClaimedPushJob, mapping: PushMapping): string {
   if (job.operation === "create") return stableGoogleEventId(job.family_event_id);
   return mapping.google_event_id || stableGoogleEventId(job.family_event_id);
@@ -269,23 +438,25 @@ async function createRemoteEvent(
   dependencies: PushDependencies,
   eventId: string,
   payload: Record<string, unknown>,
-): Promise<GooglePushEvent> {
+): Promise<RemoteWriteOutcome> {
   try {
-    return assertConfirmedEvent(await dependencies.google.insert(
+    const event = assertConfirmedEvent(await dependencies.google.insert(
       context.connection,
       context.calendar,
       context.calendar.google_calendar_id,
       eventId,
       payload,
     ), eventId);
+    return { event, finalizeLocalDelete: false };
   } catch (error) {
     if (statusOf(error) !== 409) throw error;
-    return assertConfirmedEvent(await dependencies.google.get(
+    const fetched = await dependencies.google.get(
       context.connection,
       context.calendar,
       context.calendar.google_calendar_id,
       eventId,
-    ), eventId);
+    );
+    return await resolveFetchedEvent(context, dependencies, eventId, payload, fetched);
   }
 }
 
@@ -294,7 +465,7 @@ async function updateRemoteEvent(
   dependencies: PushDependencies,
   eventId: string,
   payload: Record<string, unknown>,
-): Promise<{ event: GooglePushEvent; conflictWinner?: PushResult["conflictWinner"] }> {
+): Promise<RemoteWriteOutcome> {
   if (!context.mapping.google_etag) throw new GooglePushError("validation", 409);
   try {
     const event = await dependencies.google.update(
@@ -305,26 +476,16 @@ async function updateRemoteEvent(
       payload,
       { ifMatch: context.mapping.google_etag },
     );
-    return { event: assertConfirmedEvent(event, eventId) };
+    return { event: assertConfirmedEvent(event, eventId), finalizeLocalDelete: false };
   } catch (error) {
     if (statusOf(error) !== 412) throw error;
-    const current = assertConfirmedEvent(await dependencies.google.get(
+    const current = await dependencies.google.get(
       context.connection,
       context.calendar,
       context.calendar.google_calendar_id,
       eventId,
-    ), eventId);
-    const conflictWinner = chooseConflictWinner(context.mapping, context.familyEvent, current);
-    if (conflictWinner !== "family") return { event: current, conflictWinner };
-    const event = await dependencies.google.update(
-      context.connection,
-      context.calendar,
-      context.calendar.google_calendar_id,
-      eventId,
-      payload,
-      { ifMatch: current.etag },
     );
-    return { event: assertConfirmedEvent(event, eventId), conflictWinner };
+    return await resolveFetchedEvent(context, dependencies, eventId, payload, current);
   }
 }
 
@@ -396,28 +557,13 @@ export async function processPushJob(
         householdTimeZone: context.householdTimeZone,
       }) as Record<string, unknown>;
       if (job.operation === "create") {
-        const event = await createRemoteEvent(job, context, dependencies, eventId, payload);
-        completion = {
-          finalizeLocalDelete: false,
-          mapping: mappingConfirmation(context.familyEvent, event),
-        };
+        const created = await createRemoteEvent(job, context, dependencies, eventId, payload);
+        conflictWinner = created.conflictWinner;
+        completion = completionForOutcome(context.familyEvent, created);
       } else {
         const updated = await updateRemoteEvent(context, dependencies, eventId, payload);
         conflictWinner = updated.conflictWinner;
-        const confirmedMapping = mappingConfirmation(context.familyEvent, updated.event);
-        const { last_family_updated_at: _staleFamilyTimestamp, ...reconciledMapping } = confirmedMapping;
-        completion = {
-          finalizeLocalDelete: false,
-          mapping: conflictWinner && conflictWinner !== "family"
-            ? reconciledMapping
-            : confirmedMapping,
-          ...(conflictWinner && conflictWinner !== "family"
-            ? {
-              reconcileGoogleEvent: updated.event,
-              captureReconciledFamilyUpdatedAt: true as const,
-            }
-            : {}),
-        };
+        completion = completionForOutcome(context.familyEvent, updated);
       }
     }
   } catch (error) {

@@ -1,11 +1,26 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { registerHooks } from "node:module";
+
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (specifier.startsWith("npm:")) {
+      return {
+        shortCircuit: true,
+        url: "data:text/javascript,export function createClient(){throw new Error('Unexpected live database access')}",
+      };
+    }
+    return nextResolve(specifier, context);
+  },
+});
 
 const pushWorker = import("../supabase/functions/_shared/push-worker.ts");
+const tokenCrypto = import("../supabase/functions/_shared/crypto.ts");
 
 const FAMILY_ID = "12345678-1234-4234-8234-123456789abc";
 const STABLE_GOOGLE_ID = "fh12345678123442348234123456789abc";
 const NOW = "2026-08-27T14:00:00.000Z";
+const TEST_KEY = Buffer.alloc(32, 9).toString("base64");
 
 function job(operation = "create", overrides = {}) {
   return {
@@ -24,6 +39,7 @@ function context(overrides = {}) {
     familyEvent: {
       id: FAMILY_ID,
       household_id: "household-1",
+      person_id: "person-1",
       title: "Soccer",
       event_date: "2026-09-02",
       start_time: "18:00",
@@ -223,6 +239,114 @@ test("a 412 update retries once with the fresh ETag when Family Hub wins", async
   assert.deepEqual(deps.calls.filter(([name]) => name === "update")[1][6], { ifMatch: '"fresh-etag"' });
 });
 
+test("a repeated 412 remains pending with transient backoff", async () => {
+  const { GooglePushError, processPushJob } = await pushWorker;
+  const remote = googleEvent({ updated: "2026-08-26T11:00:00.000Z", etag: '"fresh-etag"' });
+  const deps = fakeDeps({ google: {
+    update: async (...args) => {
+      deps.calls.push(["update", ...args]);
+      throw new GooglePushError("validation", 412, "private concurrent details");
+    },
+    get: async (...args) => {
+      deps.calls.push(["get", ...args]);
+      return remote;
+    },
+  } });
+
+  const result = await processPushJob(job("update"), deps);
+
+  assert.deepEqual(result, {
+    status: "retry",
+    finalizeLocalDelete: false,
+    errorCategory: "transient",
+  });
+  assert.equal(deps.calls.filter(([name]) => name === "update").length, 2);
+  assert.deepEqual(call(deps, "fail"), [
+    "fail", "job-1", "claim-1", "transient",
+    "Google Calendar is temporarily unavailable",
+    "2026-08-27T14:01:00.000Z",
+  ]);
+  assert.equal(call(deps, "complete"), undefined);
+  assert.doesNotMatch(JSON.stringify(deps.calls), /private concurrent details/);
+});
+
+test("a newer cancelled event after 412 finalizes local deletion instead of reconciling it as synced", async () => {
+  const { GooglePushError, processPushJob } = await pushWorker;
+  const deps = fakeDeps({ google: {
+    update: async (...args) => {
+      deps.calls.push(["update", ...args]);
+      throw new GooglePushError("validation", 412);
+    },
+    get: async (...args) => {
+      deps.calls.push(["get", ...args]);
+      return {
+        id: STABLE_GOOGLE_ID,
+        status: "cancelled",
+        etag: '"deleted"',
+        updated: "2026-08-27T15:00:00.000Z",
+      };
+    },
+  } });
+
+  const result = await processPushJob(job("update"), deps);
+
+  assert.deepEqual(result, {
+    status: "complete",
+    finalizeLocalDelete: true,
+    conflictWinner: "google",
+  });
+  assert.deepEqual(call(deps, "complete"), ["complete", "job-1", "claim-1", { finalizeLocalDelete: true }]);
+});
+
+test("a Family-newer conflict with a cancelled Google event retries without resurrection", async () => {
+  const { GooglePushError, processPushJob } = await pushWorker;
+  const deps = fakeDeps({ google: {
+    update: async (...args) => {
+      deps.calls.push(["update", ...args]);
+      throw new GooglePushError("validation", 412);
+    },
+    get: async (...args) => {
+      deps.calls.push(["get", ...args]);
+      return {
+        id: STABLE_GOOGLE_ID,
+        status: "cancelled",
+        etag: '"deleted"',
+        updated: "2026-08-26T11:00:00.000Z",
+      };
+    },
+  } });
+
+  const result = await processPushJob(job("update"), deps);
+
+  assert.deepEqual(result, {
+    status: "retry",
+    finalizeLocalDelete: false,
+    errorCategory: "transient",
+  });
+  assert.equal(deps.calls.filter(([name]) => name === "update").length, 1);
+  assert.equal(call(deps, "complete"), undefined);
+  assert.equal(call(deps, "fail")[5], "2026-08-27T14:01:00.000Z");
+});
+
+test("a sparse cancelled resource deletes an unchanged local event", async () => {
+  const { GooglePushError, processPushJob } = await pushWorker;
+  const unchanged = context({ familyEvent: { updated_at: "2026-08-26T10:00:00.000Z" } });
+  const deps = fakeDeps({ context: unchanged, google: {
+    update: async () => { throw new GooglePushError("validation", 412); },
+    get: async () => ({ id: STABLE_GOOGLE_ID, status: "cancelled" }),
+  } });
+
+  const result = await processPushJob(job("update"), deps);
+
+  assert.deepEqual(result, {
+    status: "complete",
+    finalizeLocalDelete: true,
+    conflictWinner: "google",
+  });
+  assert.equal("mapping" in call(deps, "complete")[3], false);
+  assert.equal("reconcileGoogleEvent" in call(deps, "complete")[3], false);
+});
+
 test("delete accepts 204, 404, and a cancelled event and finalizes locally", async () => {
   const { GooglePushError, processPushJob } = await pushWorker;
   for (const response of [
@@ -246,9 +370,14 @@ test("attempted create-delete derives the stable ID when no mapped Google ID was
   assert.equal(call(deps, "delete")[4], STABLE_GOOGLE_ID);
 });
 
-test("ambiguous create replay confirms the stable event after an insert collision", async () => {
+test("ambiguous create replay reconciles a newer divergent Google event", async () => {
   const { GooglePushError, processPushJob } = await pushWorker;
   let run = 0;
+  const remote = googleEvent({
+    summary: "Remote soccer",
+    updated: "2026-08-27T15:00:00.000Z",
+    etag: '"remote-newer"',
+  });
   const deps = fakeDeps({
     google: {
       insert: async (...args) => {
@@ -256,6 +385,10 @@ test("ambiguous create replay confirms the stable event after an insert collisio
         run += 1;
         if (run === 1) throw new GooglePushError("transient", 503, "socket included a secret");
         throw new GooglePushError("validation", 409, "duplicate included a secret");
+      },
+      get: async (...args) => {
+        deps.calls.push(["get", ...args]);
+        return remote;
       },
     },
   });
@@ -266,8 +399,64 @@ test("ambiguous create replay confirms the stable event after an insert collisio
 
   const second = await processPushJob(job("create", { attempt_count: 2 }), deps);
   assert.equal(second.status, "complete");
+  assert.equal(second.conflictWinner, "google");
   assert.equal(deps.calls.filter(([name]) => name === "get")[0][4], STABLE_GOOGLE_ID);
+  assert.equal(deps.calls.filter(([name]) => name === "update").length, 0);
+  assert.equal(call(deps, "complete")[3].reconcileFamilyEvent.title, "Remote soccer");
+  assert.equal(call(deps, "complete")[3].captureReconciledFamilyUpdatedAt, true);
   assert.equal(deps.calls.filter(([name]) => name === "complete").length, 1);
+});
+
+test("ambiguous create replay updates Google with the fetched ETag when Family Hub is newer", async () => {
+  const { GooglePushError, processPushJob } = await pushWorker;
+  const remote = googleEvent({
+    summary: "Old remote title",
+    updated: "2026-08-26T11:00:00.000Z",
+    etag: '"collision-etag"',
+  });
+  const deps = fakeDeps({ google: {
+    insert: async (...args) => {
+      deps.calls.push(["insert", ...args]);
+      throw new GooglePushError("validation", 409);
+    },
+    get: async (...args) => {
+      deps.calls.push(["get", ...args]);
+      return remote;
+    },
+  } });
+
+  const result = await processPushJob(job("create", { attempt_count: 2 }), deps);
+
+  assert.equal(result.status, "complete");
+  assert.equal(result.conflictWinner, "family");
+  assert.deepEqual(call(deps, "update")[6], { ifMatch: '"collision-etag"' });
+  assert.equal(call(deps, "complete")[3].mapping.google_etag, '"etag-after"');
+  assert.equal("reconcileGoogleEvent" in call(deps, "complete")[3], false);
+});
+
+test("ambiguous create replay never marks a cancelled fetched event as synced", async () => {
+  const { GooglePushError, processPushJob } = await pushWorker;
+  const deps = fakeDeps({ google: {
+    insert: async () => { throw new GooglePushError("validation", 409); },
+    get: async (...args) => {
+      deps.calls.push(["get", ...args]);
+      return {
+        id: STABLE_GOOGLE_ID,
+        status: "cancelled",
+        etag: '"deleted"',
+        updated: "2026-08-27T15:00:00.000Z",
+      };
+    },
+  } });
+
+  const result = await processPushJob(job("create", { attempt_count: 2 }), deps);
+
+  assert.deepEqual(result, {
+    status: "complete",
+    finalizeLocalDelete: true,
+    conflictWinner: "google",
+  });
+  assert.deepEqual(call(deps, "complete"), ["complete", "job-1", "claim-1", { finalizeLocalDelete: true }]);
 });
 
 test("read-only or cross-owner destinations fail safely before a Google write", async () => {
@@ -315,20 +504,50 @@ test("transient failures use retry policy and fence failure with the claim token
   assert.doesNotMatch(JSON.stringify(deps.calls), /quota project private/);
 });
 
-test("a refreshed authorization path can complete without reconnect state", async () => {
-  const { processPushJob } = await pushWorker;
-  let refreshed = false;
-  const deps = fakeDeps({ google: {
-    update: async (...args) => {
-      deps.calls.push(["update", ...args]);
-      refreshed = true;
-      return googleEvent();
-    },
+test("the real Google adapter refreshes a 401 once and feeds its retry into worker completion", async () => {
+  const { createGooglePushAdapter, processPushJob } = await pushWorker;
+  const { encryptToken, decryptToken } = await tokenCrypto;
+  const requests = [];
+  let persisted;
+  const active = context({ connection: {
+    access_token_encrypted: await encryptToken("old-access", TEST_KEY),
+    refresh_token_encrypted: await encryptToken("old-refresh", TEST_KEY),
+    token_expires_at: "2099-01-01T00:00:00.000Z",
   } });
+  const environment = (name) => ({
+    GOOGLE_TOKEN_ENCRYPTION_KEY: TEST_KEY,
+    GOOGLE_CLIENT_ID: "test-client",
+    GOOGLE_CLIENT_SECRET: "test-secret",
+  })[name];
+  const google = createGooglePushAdapter({
+    env: environment,
+    now: () => new Date(NOW),
+    persistTokens: async (owner, tokens) => { persisted = { owner, tokens }; },
+    fetch: async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      requests.push(request);
+      if (request.url === "https://oauth2.googleapis.com/token") {
+        return Response.json({ access_token: "rotated-access", expires_in: 3600 });
+      }
+      const calendarAttempts = requests.filter(({ url }) => url.includes("/calendar/v3/calendars/")).length;
+      if (calendarAttempts === 1) return new Response(null, { status: 401 });
+      return Response.json(googleEvent());
+    },
+  });
+  const deps = fakeDeps({ context: active, google });
 
   const result = await processPushJob(job("update"), deps);
 
-  assert.equal(refreshed, true);
   assert.equal(result.status, "complete");
+  const refreshes = requests.filter(({ url }) => url === "https://oauth2.googleapis.com/token");
+  const calendarRequests = requests.filter(({ url }) => url.includes("/calendar/v3/calendars/"));
+  assert.equal(refreshes.length, 1);
+  assert.equal(calendarRequests.length, 2);
+  assert.equal(calendarRequests[0].headers.get("Authorization"), "Bearer old-access");
+  assert.equal(calendarRequests[1].headers.get("Authorization"), "Bearer rotated-access");
+  assert.equal(calendarRequests[1].headers.get("If-Match"), '"etag-before"');
+  assert.equal(calendarRequests[1].method, "PATCH");
+  assert.deepEqual(persisted.owner, { id: "connection-1", user_id: "owner-1" });
+  assert.equal(await decryptToken(persisted.tokens.access_token_encrypted, TEST_KEY), "rotated-access");
   assert.equal(call(deps, "reconnect"), undefined);
 });
