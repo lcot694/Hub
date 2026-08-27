@@ -114,7 +114,9 @@ test("calendar handler follows every page before atomically replacing a snapshot
   assert.equal(response.status, 200);
   assert.equal(requested.length, 2);
   assert.match(requested[1], /pageToken=page-2/);
-  assert.deepEqual(database.calls.filter(([name]) => name === "snapshot")[0][3], [
+  const snapshots = database.calls.filter(([name]) => name === "snapshot");
+  assert.equal(snapshots.length, 1);
+  assert.deepEqual(snapshots[0][3], [
     { google_calendar_id: "one", display_name: "One", time_zone: null, google_access_role: "owner", writable: true },
     { google_calendar_id: "two", display_name: "Two", time_zone: null, google_access_role: "reader", writable: false },
   ]);
@@ -156,14 +158,20 @@ test("authorization failure marks the owned connection reconnect-required", asyn
 
 test("selection submits one all-or-nothing store operation", async () => {
   const { createGoogleCalendarsHandler } = await calendarApi;
-  const database = store();
+  const database = store({ listCalendars: async () => [
+    { google_calendar_id: "one" }, { google_calendar_id: "two" },
+  ] });
   const handler = createGoogleCalendarsHandler({ authenticate: async () => ({ userId: USER_ID }), store: database });
   const response = await handler(new Request("https://project.test/google-calendars", {
     method: "PUT", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ personId: USER_ID, calendars: [{ googleCalendarId: "one", enabled: true }, { googleCalendarId: "two", enabled: false }] }),
   }));
   assert.equal(response.status, 200);
-  assert.equal(database.calls.filter(([name]) => name === "selection").length, 1);
+  const selections = database.calls.filter(([name]) => name === "selection");
+  assert.equal(selections.length, 1);
+  assert.deepEqual(selections[0].slice(1), [CONNECTION.id, USER_ID, USER_ID, [
+    { googleCalendarId: "one", enabled: true }, { googleCalendarId: "two", enabled: false },
+  ]]);
 });
 
 test("calendar handler sanitizes method and authentication failures with allowed-origin CORS", async () => {
@@ -185,4 +193,49 @@ test("calendar handler sanitizes method and authentication failures with allowed
     if (previous === undefined) delete globalThis.Deno;
     else globalThis.Deno = previous;
   }
+});
+
+test("owned connection loader validates owned, absent, membership, and household-scoped records with a Supabase query client", async () => {
+  const { createOwnedConnectionLoader } = await calendarApi;
+  for (const scenario of [
+    { name: "owned connection", connection: CONNECTION, member: true, person: true, result: CONNECTION },
+    { name: "wrong user has no row", connection: null, member: true, person: true, result: null },
+    { name: "not a member", connection: CONNECTION, member: false, person: true, status: 403 },
+    { name: "person in another household", connection: CONNECTION, member: true, person: false, status: 403 },
+  ]) {
+    const database = { from(table) {
+      const result = table === "google_connections" ? scenario.connection : table === "household_members" ? scenario.member ? {} : null : scenario.person ? {} : null;
+      return { select() { return this; }, eq() { return this; }, maybeSingle() { return Promise.resolve({ data: result, error: null }); } };
+    } };
+    if (scenario.status === undefined) assert.equal(await createOwnedConnectionLoader(database)(USER_ID), scenario.result);
+    else await assert.rejects(createOwnedConnectionLoader(database)(USER_ID), (error) => error.status === scenario.status);
+  }
+});
+
+test("handler skips disconnected connections and rejects unknown selections before the transaction", async () => {
+  const { createGoogleCalendarsHandler } = await calendarApi;
+  const disconnected = store({ loadConnection: async () => ({ ...CONNECTION, connection_state: "disconnected" }) });
+  let fetched = false;
+  const get = await createGoogleCalendarsHandler({ authenticate: async () => ({ userId: USER_ID }), store: disconnected, fetchCalendarPage: async () => { fetched = true; return { items: [] }; } })(new Request("https://project.test/google-calendars"));
+  assert.equal(get.status, 200);
+  assert.equal(fetched, false);
+  assert.equal((await get.json()).connection.state, "disconnected");
+
+  const selected = store();
+  const put = await createGoogleCalendarsHandler({ authenticate: async () => ({ userId: USER_ID }), store: selected })(new Request("https://project.test/google-calendars", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ personId: USER_ID, calendars: [{ googleCalendarId: "missing", enabled: true }] }) }));
+  assert.equal(put.status, 400);
+  assert.equal(selected.calls.some(([name]) => name === "selection"), false);
+});
+
+test("handler answers allowed OPTIONS and rejects a foreign origin", async () => {
+  const { createGoogleCalendarsHandler } = await calendarApi;
+  const previous = globalThis.Deno;
+  globalThis.Deno = { env: { get: (name) => name === "APP_ORIGIN" ? "https://family.example" : undefined } };
+  try {
+    const options = await createGoogleCalendarsHandler()(new Request("https://project.test/google-calendars", { method: "OPTIONS", headers: { Origin: "https://family.example" } }));
+    const foreign = await createGoogleCalendarsHandler()(new Request("https://project.test/google-calendars", { method: "GET", headers: { Origin: "https://evil.example" } }));
+    assert.equal(options.status, 204);
+    assert.equal(options.headers.get("Access-Control-Allow-Origin"), "https://family.example");
+    assert.deepEqual(await foreign.json(), { error: "origin_not_allowed" });
+  } finally { if (previous === undefined) delete globalThis.Deno; else globalThis.Deno = previous; }
 });

@@ -1,4 +1,21 @@
 -- Task 7 hardening: one account per adult and atomic calendar settings writes.
+-- Existing installs must explicitly remediate duplicate accounts before retrying.
+-- This deliberately leaves calendars, mappings, and queue rows untouched.
+do $$
+begin
+  if exists (
+    select 1 from public.google_connections
+    group by user_id
+    having count(*) > 1
+  ) then
+    raise exception using
+      errcode = 'P0001',
+      message = 'google_connection_duplicate_users',
+      detail = 'Inspect duplicate user_id rows and explicitly disconnect the unwanted connection before retrying.';
+  end if;
+end;
+$$;
+
 create unique index google_connections_one_account_per_user_idx
   on public.google_connections(user_id);
 

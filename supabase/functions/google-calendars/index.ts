@@ -66,9 +66,13 @@ async function loadOwnedConnection(database: SupabaseClient, userId: string): Pr
   return connection;
 }
 
+export function createOwnedConnectionLoader(database: SupabaseClient) {
+  return (userId: string) => loadOwnedConnection(database, userId);
+}
+
 function databaseStore(database: SupabaseClient): CalendarStore {
   return {
-    loadConnection: (userId) => loadOwnedConnection(database, userId),
+    loadConnection: createOwnedConnectionLoader(database),
     async replaceSnapshot(connectionId, userId, calendars) {
       const { error } = await database.rpc("replace_google_calendar_snapshot", { p_connection_id: connectionId, p_user_id: userId, p_calendars: calendars });
       if (error) throw new HttpError(503, "calendar_unavailable", "Google calendar settings are unavailable");
@@ -143,6 +147,10 @@ export function createGoogleCalendarsHandler(dependencies: GoogleCalendarsDepend
       if (req.method === "PUT") {
         if (!connection) throw new HttpError(404, "connection_not_found", "Google connection was not found");
         const selection = await readUpdate(req);
+        const knownCalendarIds = new Set((await store.listCalendars(connection.id)).map((calendar) => calendar.google_calendar_id));
+        if (selection.calendars.some((calendar) => !knownCalendarIds.has(calendar.googleCalendarId))) {
+          throw new HttpError(400, "calendar_not_available", "A selected calendar is not available");
+        }
         return json(200, await responseBody(store, await store.applySelection(connection.id, userId, selection.personId, selection.calendars)), headers);
       }
       if (!connection || connection.connection_state !== "active") return json(200, await responseBody(store, connection), headers);

@@ -86,3 +86,10 @@ Version 3 should add:
 3. Chores/routines and stars
 4. Grocery/shared lists
 5. Wall-dashboard mode
+
+GOOGLE CALENDAR ROLLOUT NOTE
+Before applying the Google Calendar hardening migration to an existing database, inspect
+google_connections for duplicate user_id values. The migration stops with
+google_connection_duplicate_users rather than deleting or moving calendars, mappings, or
+sync jobs. Explicitly disconnect the unwanted connection (after reviewing its attached
+rows), then retry the migration. Fresh installs enforce one Google account per login.

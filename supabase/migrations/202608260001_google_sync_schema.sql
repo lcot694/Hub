@@ -45,7 +45,7 @@ create table public.google_connections (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   disconnected_at timestamptz,
-  unique (user_id, google_account_id)
+  unique (user_id)
 );
 
 create table public.google_calendars (

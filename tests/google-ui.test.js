@@ -44,6 +44,42 @@ function settingsRoot() {
   return root;
 }
 
+function activeModel(calendarId = "family") {
+  return {
+    connection: { state: "active", personId: "person", displayEmail: "adult@example.test" },
+    calendars: [{ googleCalendarId: calendarId, summary: calendarId, enabled: true, writable: true }],
+  };
+}
+
+function settingsFixture() {
+  const document = fakeDocument();
+  const root = settingsRoot();
+  const requests = [];
+  const supabase = { functions: { invoke(name, options) {
+    return new Promise((resolve) => requests.push({ name, options, resolve }));
+  } } };
+  const settings = createGoogleSettings({
+    supabase, root, document, location: { assign() {} },
+    getContext: () => ({ householdId: "household", people: [{ id: "person", name: "Parent" }] }),
+  });
+  return { root, requests, settings };
+}
+
+async function loadInitialModel(fixture, model = activeModel()) {
+  const loading = fixture.settings.load();
+  fixture.requests[0].resolve({ data: model, error: null });
+  await loading;
+}
+
+function calendarCheckbox(root) {
+  return root.querySelector("#googleCalendarList").querySelector('input[type="checkbox"]');
+}
+
+function controlsAreDisabled(root) {
+  return ["googleConnectBtn", "googlePerson", "googleSyncNowBtn", "googleDisconnectBtn"]
+    .every((id) => root.querySelector(`#${id}`).disabled);
+}
+
 test("read-only calendars cannot become event destinations", () => {
   const options = calendarDestinationOptions([
     { id: "family", summary: "Family", enabled: true, writable: true },
@@ -105,4 +141,71 @@ test("controller renders loading, disconnected, and reconnect states", async () 
   await reconnect;
   assert.match(root.querySelector("#googleCalendarList").textContent, /Reconnect Google Calendar/);
   assert.deepEqual(settings.calendarDestinationOptions().map((option) => option.value), ["family-hub-only"]);
+});
+
+test("a newer load invalidates an older save response", async () => {
+  const fixture = settingsFixture();
+  await loadInitialModel(fixture);
+  const checkbox = calendarCheckbox(fixture.root);
+  checkbox.checked = false;
+  const saving = checkbox.fire("change");
+  const loading = fixture.settings.load();
+
+  fixture.requests[2].resolve({ data: activeModel("loaded-after-save"), error: null });
+  await loading;
+  fixture.requests[1].resolve({ data: activeModel("stale-save"), error: null });
+  await saving;
+
+  assert.deepEqual(fixture.settings.calendarDestinationOptions().map((option) => option.value), ["family-hub-only", "loaded-after-save"]);
+});
+
+test("a newer save invalidates an older load response", async () => {
+  const fixture = settingsFixture();
+  await loadInitialModel(fixture);
+  const checkbox = calendarCheckbox(fixture.root);
+  const loading = fixture.settings.load();
+  fixture.root.querySelector("#googleCalendarList").append(checkbox);
+  checkbox.checked = false;
+  const saving = checkbox.fire("change");
+
+  fixture.requests[2].resolve({ data: activeModel("saved-after-load"), error: null });
+  await saving;
+  fixture.requests[1].resolve({ data: activeModel("stale-load"), error: null });
+  await loading;
+
+  assert.deepEqual(fixture.settings.calendarDestinationOptions().map((option) => option.value), ["family-hub-only", "saved-after-load"]);
+});
+
+test("the newest overlapping save response wins", async () => {
+  const fixture = settingsFixture();
+  await loadInitialModel(fixture);
+  const checkbox = calendarCheckbox(fixture.root);
+  checkbox.checked = false;
+  const firstSave = checkbox.fire("change");
+  checkbox.checked = true;
+  const secondSave = checkbox.fire("change");
+
+  fixture.requests[2].resolve({ data: activeModel("newest-save"), error: null });
+  await secondSave;
+  fixture.requests[1].resolve({ data: activeModel("stale-save"), error: null });
+  await firstSave;
+
+  assert.deepEqual(fixture.settings.calendarDestinationOptions().map((option) => option.value), ["family-hub-only", "newest-save"]);
+});
+
+test("controls stay disabled until every overlapping operation settles", async () => {
+  const fixture = settingsFixture();
+  await loadInitialModel(fixture);
+  const checkbox = calendarCheckbox(fixture.root);
+  checkbox.checked = false;
+  const saving = checkbox.fire("change");
+  const loading = fixture.settings.load();
+  assert.equal(controlsAreDisabled(fixture.root), true);
+
+  fixture.requests[2].resolve({ data: activeModel("newest-load"), error: null });
+  await loading;
+  assert.equal(controlsAreDisabled(fixture.root), true);
+  fixture.requests[1].resolve({ data: activeModel("stale-save"), error: null });
+  await saving;
+  assert.equal(controlsAreDisabled(fixture.root), false);
 });
