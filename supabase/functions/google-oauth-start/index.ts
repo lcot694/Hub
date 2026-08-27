@@ -95,7 +95,7 @@ export async function handleOAuthStart(
   const preflight = handleCors(req);
   if (preflight) return preflight;
 
-  let responseHeaders: Headers;
+  let responseHeaders = new Headers({ Vary: "Origin" });
   try {
     responseHeaders = corsHeaders(req);
     if (req.method !== "POST") {
@@ -147,9 +147,9 @@ export async function handleOAuthStart(
     return json(200, { authorizationUrl: authorizationUrl.toString() }, responseHeaders);
   } catch (error) {
     if (error instanceof HttpError) {
-      return json(error.status, { error: error.code }, { Vary: "Origin" });
+      return json(error.status, { error: error.code }, responseHeaders);
     }
-    return json(500, { error: "internal_error" }, { Vary: "Origin" });
+    return json(500, { error: "internal_error" }, responseHeaders);
   }
 }
 

@@ -10,6 +10,9 @@ const SANITIZED_ERROR_CODES = new Set([
   "invalid_state",
   "token_exchange_failed",
   "account_lookup_failed",
+  "authorization_revoked",
+  "context_mismatch",
+  "refresh_token_required",
   "connection_failed",
 ]);
 
@@ -19,6 +22,9 @@ type SanitizedErrorCode =
   | "invalid_state"
   | "token_exchange_failed"
   | "account_lookup_failed"
+  | "authorization_revoked"
+  | "context_mismatch"
+  | "refresh_token_required"
   | "connection_failed";
 
 type FetchImplementation = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
@@ -44,13 +50,21 @@ interface ConsumedFlow {
 
 interface GoogleTokens {
   access_token: string;
-  refresh_token: string;
+  refresh_token?: string;
   expires_in: number;
 }
 
 interface GoogleUserInfo {
   sub: string;
   email: string | null;
+}
+
+interface ExistingConnection {
+  id: string;
+  user_id: string;
+  household_id: string;
+  person_id: string;
+  refresh_token_encrypted: string | null;
 }
 
 class OAuthCallbackError extends Error {
@@ -137,6 +151,32 @@ async function consumeFlow(
   return { flow, context: parseFlowContext(flow.redirect_path) };
 }
 
+async function verifyFlowAuthorization(
+  database: SupabaseClient,
+  flow: ConsumedFlow,
+  context: FlowContext,
+): Promise<void> {
+  const membership = await database
+    .from("household_members")
+    .select("household_id")
+    .eq("household_id", flow.household_id)
+    .eq("user_id", flow.user_id)
+    .maybeSingle();
+  if (membership.error || !membership.data) {
+    throw new OAuthCallbackError("authorization_revoked");
+  }
+
+  const person = await database
+    .from("people")
+    .select("id")
+    .eq("household_id", flow.household_id)
+    .eq("id", context.personId)
+    .maybeSingle();
+  if (person.error || !person.data) {
+    throw new OAuthCallbackError("authorization_revoked");
+  }
+}
+
 async function exchangeCode(
   code: string,
   pkceVerifier: string,
@@ -173,7 +213,7 @@ async function exchangeCode(
   const tokens = body as Record<string, unknown>;
   if (
     typeof tokens.access_token !== "string" ||
-    typeof tokens.refresh_token !== "string" ||
+    (tokens.refresh_token !== undefined && typeof tokens.refresh_token !== "string") ||
     typeof tokens.expires_in !== "number" ||
     !Number.isFinite(tokens.expires_in) ||
     tokens.expires_in <= 0
@@ -220,27 +260,50 @@ async function loadGoogleUser(
   };
 }
 
+async function findExistingConnection(
+  database: SupabaseClient,
+  userId: string,
+  googleAccountId: string,
+): Promise<ExistingConnection | null> {
+  const { data, error } = await database
+    .from("google_connections")
+    .select("id,user_id,household_id,person_id,refresh_token_encrypted")
+    .eq("user_id", userId)
+    .eq("google_account_id", googleAccountId)
+    .maybeSingle();
+  if (error) throw new OAuthCallbackError("connection_failed");
+  return data as ExistingConnection | null;
+}
+
 async function saveConnection(
   database: SupabaseClient,
   flow: ConsumedFlow,
   context: FlowContext,
   tokens: GoogleTokens,
   userinfo: GoogleUserInfo,
+  existing: ExistingConnection | null,
   now: Date,
   env: (name: string) => string,
   encrypt: typeof encryptToken,
 ): Promise<void> {
   const encryptionKey = env("GOOGLE_TOKEN_ENCRYPTION_KEY");
-  const [accessTokenEncrypted, refreshTokenEncrypted] = await Promise.all([
-    encrypt(tokens.access_token, encryptionKey),
-    encrypt(tokens.refresh_token, encryptionKey),
-  ]);
+  if (
+    existing &&
+    (existing.household_id !== flow.household_id || existing.person_id !== context.personId)
+  ) {
+    throw new OAuthCallbackError("context_mismatch");
+  }
+
+  const accessTokenEncrypted = await encrypt(tokens.access_token, encryptionKey);
+  const refreshTokenEncrypted = tokens.refresh_token
+    ? await encrypt(tokens.refresh_token, encryptionKey)
+    : existing?.refresh_token_encrypted;
+  if (!refreshTokenEncrypted) {
+    throw new OAuthCallbackError("refresh_token_required");
+  }
   const tokenExpiresAt = new Date(now.getTime() + tokens.expires_in * 1000).toISOString();
-  const { error } = await database.from("google_connections").upsert({
-    user_id: flow.user_id,
-    household_id: flow.household_id,
-    person_id: context.personId,
-    google_account_id: userinfo.sub,
+
+  const credentialValues = {
     display_email: userinfo.email,
     access_token_encrypted: accessTokenEncrypted,
     refresh_token_encrypted: refreshTokenEncrypted,
@@ -249,7 +312,31 @@ async function saveConnection(
     last_error: null,
     updated_at: now.toISOString(),
     disconnected_at: null,
-  }, { onConflict: "user_id,google_account_id" });
+  };
+
+  if (existing) {
+    const { data, error } = await database.from("google_connections").update(credentialValues)
+      .eq("id", existing.id)
+      .eq("user_id", flow.user_id)
+      .select("id");
+    if (
+      error ||
+      !Array.isArray(data) ||
+      data.length !== 1 ||
+      data[0]?.id !== existing.id
+    ) {
+      throw new OAuthCallbackError("connection_failed");
+    }
+    return;
+  }
+
+  const { error } = await database.from("google_connections").insert({
+    user_id: flow.user_id,
+    household_id: flow.household_id,
+    person_id: context.personId,
+    google_account_id: userinfo.sub,
+    ...credentialValues,
+  });
   if (error) throw new OAuthCallbackError("connection_failed");
 }
 
@@ -280,9 +367,11 @@ export async function handleOAuthCallback(
     if (!code || code.length > 4096) {
       throw new OAuthCallbackError("invalid_request");
     }
+    await verifyFlowAuthorization(database, flow, context);
     const tokens = await exchangeCode(code, context.pkceVerifier, fetchImplementation, env);
     const userinfo = await loadGoogleUser(tokens.access_token, fetchImplementation);
-    await saveConnection(database, flow, context, tokens, userinfo, now, env, encrypt);
+    const existing = await findExistingConnection(database, flow.user_id, userinfo.sub);
+    await saveConnection(database, flow, context, tokens, userinfo, existing, now, env, encrypt);
     return appRedirect(appOrigin);
   } catch (error) {
     const code = error instanceof OAuthCallbackError ? error.code : "connection_failed";
