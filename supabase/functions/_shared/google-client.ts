@@ -11,6 +11,7 @@ export type GoogleErrorCategory =
 
 export interface GoogleConnection {
   id: string;
+  user_id: string;
   access_token_encrypted: string;
   refresh_token_encrypted: string | null;
   token_expires_at: string | null;
@@ -23,12 +24,34 @@ export interface PersistedTokens {
 }
 
 type FetchImplementation = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+const ALLOWED_GOOGLE_API_HOSTS = new Set([
+  "www.googleapis.com",
+  "calendar.googleapis.com",
+]);
 
 export interface GoogleClientDependencies {
   fetch?: FetchImplementation;
   now?: () => Date;
   env?: (name: string) => string;
-  persistTokens?: (connectionId: string, tokens: PersistedTokens) => Promise<void>;
+  database?: TokenPersistenceDatabase;
+  persistTokens?: (owner: GoogleConnectionOwner, tokens: PersistedTokens) => Promise<void>;
+}
+
+export type GoogleConnectionOwner = Pick<GoogleConnection, "id" | "user_id">;
+
+interface TokenPersistenceResult {
+  data: Array<{ id: string }> | null;
+  error: unknown;
+}
+
+interface TokenPersistenceQuery {
+  update(values: PersistedTokens): TokenPersistenceQuery;
+  eq(column: string, value: string): TokenPersistenceQuery;
+  select(columns: string): PromiseLike<TokenPersistenceResult>;
+}
+
+export interface TokenPersistenceDatabase {
+  from(table: string): TokenPersistenceQuery;
 }
 
 interface GoogleTokenResponse {
@@ -60,21 +83,49 @@ export function classifyGoogleStatus(status: number): GoogleErrorCategory {
   return "permanent";
 }
 
-async function persistTokens(
-  connectionId: string,
+export async function persistConnectionTokens(
+  owner: GoogleConnectionOwner,
   tokens: PersistedTokens,
+  database: TokenPersistenceDatabase = createServiceClient() as unknown as TokenPersistenceDatabase,
 ): Promise<void> {
-  const { error } = await createServiceClient()
+  if (!owner.id || !owner.user_id) {
+    throw new GoogleApiError("transient", 503, "Google credential update failed");
+  }
+
+  const { data, error } = await database
     .from("google_connections")
     .update(tokens)
-    .eq("id", connectionId);
-  if (error) throw new GoogleApiError("transient", 503, "Google credential update failed");
+    .eq("id", owner.id)
+    .eq("user_id", owner.user_id)
+    .select("id");
+  if (
+    error ||
+    !Array.isArray(data) ||
+    data.length !== 1 ||
+    data[0]?.id !== owner.id
+  ) {
+    throw new GoogleApiError("transient", 503, "Google credential update failed");
+  }
 }
 
 function requestWithAuthorization(request: Request, accessToken: string): Request {
   const headers = new Headers(request.headers);
   headers.set("Authorization", `Bearer ${accessToken}`);
   return new Request(request.clone(), { headers });
+}
+
+function requireGoogleApiDestination(request: Request): Request {
+  const url = new URL(request.url);
+  if (
+    url.protocol !== "https:" ||
+    url.port !== "" ||
+    url.username !== "" ||
+    url.password !== "" ||
+    !ALLOWED_GOOGLE_API_HOSTS.has(url.hostname)
+  ) {
+    throw new GoogleApiError("validation", 400, "Google API destination is not allowed");
+  }
+  return new Request(request.clone(), { redirect: "error" });
 }
 
 async function fetchSafely(
@@ -103,9 +154,16 @@ export async function googleFetch(
   const fetchImplementation = dependencies.fetch ?? fetch;
   const now = dependencies.now ?? (() => new Date());
   const env = dependencies.env ?? requiredServerEnv;
-  const saveTokens = dependencies.persistTokens ?? persistTokens;
+  const saveTokens = dependencies.persistTokens ?? ((
+    owner: GoogleConnectionOwner,
+    tokens: PersistedTokens,
+  ) => (
+    persistConnectionTokens(owner, tokens, dependencies.database)
+  ));
+  const originalRequest = requireGoogleApiDestination(
+    request instanceof Request ? request.clone() : new Request(request),
+  );
   const encryptionKey = env("GOOGLE_TOKEN_ENCRYPTION_KEY");
-  const originalRequest = request instanceof Request ? request.clone() : new Request(request);
   let accessToken = await decryptToken(connection.access_token_encrypted, encryptionKey);
   let refreshAttempted = false;
 
@@ -161,7 +219,7 @@ export async function googleFetch(
     };
 
     try {
-      await saveTokens(connection.id, tokens);
+      await saveTokens({ id: connection.id, user_id: connection.user_id }, tokens);
     } catch {
       throw new GoogleApiError("transient", 503, "Google credential update failed");
     }
