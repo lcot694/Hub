@@ -295,6 +295,28 @@ begin
       errcode = '42501',
       message = 'google_calendar_read_only';
   end if;
+
+  -- Family-Hub-only events have no mapping and keep their normal direct
+  -- update path. Any Google-owned field change must belong to the caller's
+  -- active, enabled, writable destination.
+  if exists (
+    select 1
+    from public.google_event_mappings m
+    where m.family_event_id = p_family_event_id
+  ) and not exists (
+    select 1
+    from public.google_event_mappings m
+    join public.google_connections c on c.id = m.google_connection_id
+    join public.google_calendars cal on cal.id = m.google_calendar_id
+    where m.family_event_id = p_family_event_id
+      and c.user_id = auth.uid()
+      and c.connection_state = 'active'
+      and cal.enabled and cal.is_writable
+  ) then
+    raise exception using
+      errcode = '42501',
+      message = 'google_event_destination_unavailable';
+  end if;
 end;
 $$;
 
@@ -310,6 +332,9 @@ as $$
 declare
   v_locked_event_id uuid;
   v_mapping_id uuid;
+  v_mapping_connection_id uuid;
+  v_mapping_calendar_id uuid;
+  v_locked_connection_id uuid;
   v_processing_id uuid;
   v_processing_operation text;
   v_queue_id uuid;
@@ -318,6 +343,8 @@ begin
     raise exception 'Unsupported Google sync operation';
   end if;
 
+  -- Queue mutations always lock event → mapping → connection/calendar → queue.
+  -- Callers use this same order before invoking the helper.
   select e.id into v_locked_event_id
   from public.events e
   where e.id = p_family_event_id
@@ -327,12 +354,24 @@ begin
     return null;
   end if;
 
-  select m.id into v_mapping_id
+  select m.id, m.google_connection_id, m.google_calendar_id
+  into v_mapping_id, v_mapping_connection_id, v_mapping_calendar_id
   from public.google_event_mappings m
   where m.family_event_id = p_family_event_id
   for update of m;
 
   if v_mapping_id is null then
+    return null;
+  end if;
+
+  select c.id into v_locked_connection_id
+  from public.google_connections c
+  join public.google_calendars cal on cal.google_connection_id = c.id
+  where c.id = v_mapping_connection_id
+    and cal.id = v_mapping_calendar_id
+  for update of c, cal;
+
+  if v_locked_connection_id is null then
     return null;
   end if;
 
@@ -457,6 +496,12 @@ begin
   end if;
 
   if jsonb_typeof(p_event) <> 'object'
+    or not (p_event ? 'household_id')
+    or not (p_event ? 'google_calendar_id')
+    or not (p_event ? 'title')
+    or not (p_event ? 'event_date')
+    or not (p_event ? 'all_day')
+    or not (p_event ? 'recurrence')
     or jsonb_typeof(p_event->'household_id') <> 'string'
     or jsonb_typeof(p_event->'google_calendar_id') <> 'string'
     or (p_event ? 'id' and jsonb_typeof(p_event->'id') <> 'string')
@@ -484,7 +529,9 @@ begin
     v_all_day := coalesce((p_event->>'all_day')::boolean, false);
     v_recurrence := coalesce(p_event->>'recurrence', 'none');
     v_recurrence_end := nullif(p_event->>'recurrence_end', '')::date;
-  exception when invalid_text_representation or datetime_field_overflow then
+  -- UUID/date/time casts can raise 22P02, 22007, or 22008; clients receive
+  -- the single safe validation contract instead of parser-specific details.
+  exception when invalid_text_representation or invalid_datetime_format or datetime_field_overflow then
     raise exception using
       errcode = '22023',
       message = 'google_event_invalid_payload';
@@ -515,23 +562,25 @@ begin
       message = 'google_event_invalid_person';
   end if;
 
-  select c.id into v_connection_id
-  from public.google_connections c
-  join public.google_calendars cal on cal.google_connection_id = c.id
-  where cal.id = v_calendar_id
-    and c.user_id = auth.uid()
-    and c.household_id = v_household_id
-    and c.connection_state = 'active'
-    and cal.enabled and cal.is_writable
-  for update of c, cal;
-
-  if v_connection_id is null then
-    raise exception using
-      errcode = '42501',
-      message = 'google_event_destination_unavailable';
-  end if;
-
   if v_event_id is null then
+    -- A new event has no event/mapping rows yet, so it validates and locks
+    -- the destination before inserting the transactional event/mapping/job.
+    select c.id into v_connection_id
+    from public.google_connections c
+    join public.google_calendars cal on cal.google_connection_id = c.id
+    where cal.id = v_calendar_id
+      and c.user_id = auth.uid()
+      and c.household_id = v_household_id
+      and c.connection_state = 'active'
+      and cal.enabled and cal.is_writable
+    for update of c, cal;
+
+    if v_connection_id is null then
+      raise exception using
+        errcode = '42501',
+        message = 'google_event_destination_unavailable';
+    end if;
+
     insert into public.events (
       household_id, person_id, title, event_date, start_time, end_time,
       all_day, recurrence, recurrence_end, created_by
@@ -551,6 +600,8 @@ begin
     return v_event_id;
   end if;
 
+  -- Existing mapped-event writes use one lock order: event → mapping →
+  -- connection/calendar → queue. This matches delete and prevents inversion.
   select e.* into v_existing_event
   from public.events e
   where e.id = v_event_id
@@ -568,9 +619,25 @@ begin
   where m.family_event_id = v_event_id
   for update of m;
 
-  if not found
-    or v_mapping.google_connection_id <> v_connection_id
-    or v_mapping.google_calendar_id <> v_calendar_id then
+  if not found then
+    raise exception using
+      errcode = '42501',
+      message = 'google_event_destination_unavailable';
+  end if;
+
+  select c.id into v_connection_id
+  from public.google_connections c
+  join public.google_calendars cal on cal.google_connection_id = c.id
+  where c.id = v_mapping.google_connection_id
+    and cal.id = v_calendar_id
+    and v_mapping.google_calendar_id = v_calendar_id
+    and c.user_id = auth.uid()
+    and c.household_id = v_household_id
+    and c.connection_state = 'active'
+    and cal.enabled and cal.is_writable
+  for update of c, cal;
+
+  if v_connection_id is null then
     raise exception using
       errcode = '42501',
       message = 'google_event_destination_unavailable';
@@ -613,6 +680,7 @@ as $$
 declare
   v_event public.events%rowtype;
   v_mapping public.google_event_mappings%rowtype;
+  v_connection_id uuid;
   v_pending_create_id uuid;
 begin
   if auth.uid() is null then
@@ -621,10 +689,8 @@ begin
       message = 'google_event_not_authenticated';
   end if;
 
-  -- Keep the trigger/RPC authorization boundary shared, then apply the
-  -- stricter caller-owned active-connection check below.
-  perform public.assert_google_event_change_allowed(p_family_event_id);
-
+  -- Existing mapped-event deletes use event → mapping → connection/calendar
+  -- → queue, matching save and the internal queue helper's first two locks.
   select e.* into v_event
   from public.events e
   where e.id = p_family_event_id
@@ -639,13 +705,8 @@ begin
 
   select m.* into v_mapping
   from public.google_event_mappings m
-  join public.google_connections c on c.id = m.google_connection_id
-  join public.google_calendars cal on cal.id = m.google_calendar_id
   where m.family_event_id = p_family_event_id
-    and c.user_id = auth.uid()
-    and c.connection_state = 'active'
-    and cal.enabled and cal.is_writable
-  for update of m, c, cal;
+  for update of m;
 
   if not found then
     raise exception using
@@ -653,17 +714,43 @@ begin
       message = 'google_event_destination_unavailable';
   end if;
 
+  select c.id into v_connection_id
+  from public.google_connections c
+  join public.google_calendars cal on cal.google_connection_id = c.id
+  where c.id = v_mapping.google_connection_id
+    and cal.id = v_mapping.google_calendar_id
+    and c.user_id = auth.uid()
+    and c.connection_state = 'active'
+    and cal.enabled and cal.is_writable
+  for update of c, cal;
+
+  if v_connection_id is null then
+    raise exception using
+      errcode = '42501',
+      message = 'google_event_destination_unavailable';
+  end if;
+
+  perform public.assert_google_event_change_allowed(p_family_event_id);
+
   select q.id into v_pending_create_id
   from public.google_sync_queue q
   where q.family_event_id = p_family_event_id
     and q.google_event_mapping_id = v_mapping.id
     and q.status = 'pending'
     and q.operation = 'create'
+    and q.attempt_count = 0
+    and not exists (
+      select 1
+      from public.google_sync_queue q_attempt
+      where q_attempt.family_event_id = p_family_event_id
+        and q_attempt.google_event_mapping_id = v_mapping.id
+        and (q_attempt.status = 'processing' or q_attempt.attempt_count > 0)
+    )
   for update;
 
   if v_pending_create_id is not null then
-    -- Google has not seen this event, so cancelling the local creation is
-    -- safer than sending a delete for an event that does not exist remotely.
+    -- This create has never been claimed, so Google cannot know its stable ID.
+    -- It is safe to cancel the local event/mapping instead of queuing delete.
     delete from public.google_sync_queue where id = v_pending_create_id;
     delete from public.google_event_mappings where id = v_mapping.id;
     delete from public.events where id = p_family_event_id;
