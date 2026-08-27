@@ -104,3 +104,58 @@ test("multiple recurrence rules and positional rules are read-only", () => {
   assert.deepEqual(multiple, { supported:false, readOnlyReason:"complex_recurrence" });
   assert.deepEqual(positional, { supported:false, readOnlyReason:"complex_recurrence" });
 });
+
+test("cross-zone recurring events are read-only to preserve daylight-saving wall time", () => {
+  const result = googleToFamilyEvent({
+    id:"g6", summary:"Pacific series",
+    start:{ dateTime:"2026-03-08T09:00:00-07:00", timeZone:"America/Los_Angeles" },
+    end:{ dateTime:"2026-03-08T10:00:00-07:00", timeZone:"America/Los_Angeles" },
+    recurrence:["RRULE:FREQ=WEEKLY"]
+  }, context);
+
+  assert.deepEqual(result, { supported:false, readOnlyReason:"recurring_time_zone_mismatch" });
+});
+
+test("same-zone recurring events remain writable across daylight-saving time", () => {
+  const result = googleToFamilyEvent({
+    id:"g7", summary:"Local series",
+    start:{ dateTime:"2026-03-08T09:00:00-04:00", timeZone:"America/Toronto" },
+    end:{ dateTime:"2026-03-08T10:00:00-04:00", timeZone:"America/Toronto" },
+    recurrence:["RRULE:FREQ=WEEKLY"]
+  }, context);
+
+  assert.equal(result.supported, true);
+  assert.equal(result.event.recurrence, "weekly");
+});
+
+test("multi-day Google events are read-only because Family Hub has no end date", () => {
+  const allDay = googleToFamilyEvent({
+    id:"g8", start:{ date:"2026-09-01" }, end:{ date:"2026-09-03" }
+  }, context);
+  const timed = googleToFamilyEvent({
+    id:"g9", start:{ dateTime:"2026-09-01T18:00:00-04:00" }, end:{ dateTime:"2026-09-02T01:00:00-04:00" }
+  }, context);
+
+  assert.deepEqual(allDay, { supported:false, readOnlyReason:"multi_day_event" });
+  assert.deepEqual(timed, { supported:false, readOnlyReason:"multi_day_event" });
+});
+
+test("outbound timed events reject an end before their start", () => {
+  assert.throws(() => familyToGoogleEvent({
+    title:"Invalid", event_date:"2026-09-02", start_time:"18:00", end_time:"17:00", all_day:false, recurrence:"none"
+  }, context), /end time must not be earlier than start time/);
+});
+
+test("omitted household zones default to Toronto without shifting a near-midnight event", () => {
+  const defaultContext = { householdId:"h1", defaultPersonId:"p1" };
+  const result = googleToFamilyEvent({
+    id:"g10", start:{ dateTime:"2026-08-27T03:30:00Z" }, end:{ dateTime:"2026-08-27T03:45:00Z" }
+  }, defaultContext);
+  const payload = familyToGoogleEvent({
+    title:"Default zone", event_date:"2026-08-26", start_time:"23:30", end_time:"23:45", all_day:false, recurrence:"none"
+  }, defaultContext);
+
+  assert.equal(result.event.event_date, "2026-08-26");
+  assert.equal(result.event.start_time, "23:30");
+  assert.equal(payload.start.timeZone, "America/Toronto");
+});
