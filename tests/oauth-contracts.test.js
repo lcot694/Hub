@@ -305,6 +305,7 @@ test("OAuth reconnect rejects a different household or person without updating s
       user_id: USER_ID,
       household_id: mismatch.household_id,
       person_id: mismatch.person_id,
+      google_account_id: "google-account",
       refresh_token_encrypted: "encrypted:old-refresh",
     };
     const database = callbackDatabase({ existing });
@@ -326,6 +327,7 @@ test("OAuth reconnect preserves the encrypted refresh token when Google omits ro
     user_id: USER_ID,
     household_id: HOUSEHOLD_ID,
     person_id: PERSON_ID,
+    google_account_id: "google-account",
     refresh_token_encrypted: "encrypted:old-refresh",
   };
   const database = callbackDatabase({ existing });
@@ -341,6 +343,21 @@ test("OAuth reconnect preserves the encrypted refresh token when Google omits ro
   assert.equal(database.writes[0].values.refresh_token_encrypted, "encrypted:old-refresh");
   assert.equal(database.writes[0].values.household_id, undefined);
   assert.equal(database.writes[0].values.person_id, undefined);
+});
+
+test("OAuth callback rejects switching to another Google account for the same adult", async () => {
+  const { handleOAuthCallback } = await oauthCallback;
+  const existing = {
+    id: "connection-1", user_id: USER_ID, household_id: HOUSEHOLD_ID, person_id: PERSON_ID,
+    google_account_id: "first-google-account", refresh_token_encrypted: "encrypted:old-refresh",
+  };
+  const database = callbackDatabase({ existing });
+  const google = googleFetch({ accountId: "second-google-account" });
+
+  const response = await handleOAuthCallback(callbackRequest(), callbackDependencies(database, google.implementation));
+
+  assert.equal(response.headers.get("Location"), `${APP_ORIGIN}/?google=error&code=account_switch_requires_disconnect`);
+  assert.equal(database.writes.length, 0);
 });
 
 test("OAuth first connection requires a Google refresh token", async () => {

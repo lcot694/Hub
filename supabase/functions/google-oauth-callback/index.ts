@@ -12,6 +12,7 @@ const SANITIZED_ERROR_CODES = new Set([
   "account_lookup_failed",
   "authorization_revoked",
   "context_mismatch",
+  "account_switch_requires_disconnect",
   "refresh_token_required",
   "connection_failed",
 ]);
@@ -24,6 +25,7 @@ type SanitizedErrorCode =
   | "account_lookup_failed"
   | "authorization_revoked"
   | "context_mismatch"
+  | "account_switch_requires_disconnect"
   | "refresh_token_required"
   | "connection_failed";
 
@@ -64,6 +66,7 @@ interface ExistingConnection {
   user_id: string;
   household_id: string;
   person_id: string;
+  google_account_id: string;
   refresh_token_encrypted: string | null;
 }
 
@@ -260,16 +263,14 @@ async function loadGoogleUser(
   };
 }
 
-async function findExistingConnection(
+async function findUserConnection(
   database: SupabaseClient,
   userId: string,
-  googleAccountId: string,
 ): Promise<ExistingConnection | null> {
   const { data, error } = await database
     .from("google_connections")
-    .select("id,user_id,household_id,person_id,refresh_token_encrypted")
+    .select("id,user_id,household_id,person_id,google_account_id,refresh_token_encrypted")
     .eq("user_id", userId)
-    .eq("google_account_id", googleAccountId)
     .maybeSingle();
   if (error) throw new OAuthCallbackError("connection_failed");
   return data as ExistingConnection | null;
@@ -370,7 +371,10 @@ export async function handleOAuthCallback(
     await verifyFlowAuthorization(database, flow, context);
     const tokens = await exchangeCode(code, context.pkceVerifier, fetchImplementation, env);
     const userinfo = await loadGoogleUser(tokens.access_token, fetchImplementation);
-    const existing = await findExistingConnection(database, flow.user_id, userinfo.sub);
+    const existing = await findUserConnection(database, flow.user_id);
+    if (existing && existing.google_account_id !== userinfo.sub) {
+      throw new OAuthCallbackError("account_switch_requires_disconnect");
+    }
     await saveConnection(database, flow, context, tokens, userinfo, existing, now, env, encrypt);
     return appRedirect(appOrigin);
   } catch (error) {
