@@ -45,12 +45,18 @@ test("a later forward migration replaces every previously installed GUC-affected
     "request_google_event_delete",
     "complete_google_push_job",
     "apply_google_pull_page",
+    "guard_direct_mapped_event_update",
   ]) {
     assert.match(sql, new RegExp(`create or replace function public\\.${routine}\\s*\\(`, "i"), `${routine} must be superseded`);
   }
   assert.doesNotMatch(sql, /app\.skip_google_event_queue|set_config\s*\(|current_setting\s*\(/i);
   assert.match(sql, /security definer/ig);
   assert.match(sql, /set search_path = public/ig);
+  assert.match(sql, /create or replace function public\.google_mapped_event_owner\s*\(p_family_event_id uuid\)/i);
+  const guard = sql.match(/create or replace function public\.guard_direct_mapped_event_update[\s\S]*?\n\$\$;/i)?.[0] ?? "";
+  assert.match(guard, /security invoker/i);
+  assert.match(guard, /current_user\s*<>\s*'authenticated'/i);
+  assert.match(guard, /public\.google_mapped_event_owner\(old\.id\)/i);
 });
 
 test("forward replacements preserve grants for browser and service-role entry points", async () => {
