@@ -160,6 +160,23 @@ test("disconnect cleanup migration scopes every destructive step and credential 
   assert.doesNotMatch(sql, /http|googleapis|google_event_id\s*=|delete_google/i);
 });
 
+test("keep_local makes a pending delete visible before detaching its Google mapping", async () => {
+  const sql = await readFile(new URL("../supabase/migrations/202608270007_google_disconnect_race_hardening.sql", import.meta.url), "utf8");
+  const clearPendingDelete = sql.indexOf("set sync_deleted_at = null");
+  const deleteQueue = sql.indexOf("delete from public.google_sync_queue");
+  const deleteMappings = sql.indexOf("delete from public.google_event_mappings");
+  assert.ok(clearPendingDelete >= 0);
+  assert.ok(clearPendingDelete < deleteQueue);
+  assert.ok(deleteQueue < deleteMappings);
+  assert.match(sql, /where e\.id = any\(v_event_ids\)/i);
+});
+
+test("disconnect invalidates pre-existing OAuth flows and advances the connection generation", async () => {
+  const sql = await readFile(new URL("../supabase/migrations/202608270007_google_disconnect_race_hardening.sql", import.meta.url), "utf8");
+  assert.match(sql, /update public\.google_oauth_flows[\s\S]*consumed_at = clock_timestamp\(\)[\s\S]*user_id = p_user_id[\s\S]*consumed_at is null/i);
+  assert.match(sql, /oauth_generation = c\.oauth_generation \+ 1/i);
+});
+
 test("disconnect returns sanitized authenticated errors with exact-origin CORS", async () => {
   const { createGoogleDisconnectHandler } = await disconnectApi;
   const { HttpError } = await import("../supabase/functions/_shared/http.ts");

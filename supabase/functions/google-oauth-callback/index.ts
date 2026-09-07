@@ -47,6 +47,7 @@ interface FlowContext {
 interface ConsumedFlow {
   user_id: string;
   household_id: string;
+  connection_generation: number;
   redirect_path: string;
 }
 
@@ -68,6 +69,7 @@ interface ExistingConnection {
   person_id: string;
   google_account_id: string;
   refresh_token_encrypted: string | null;
+  oauth_generation: number;
 }
 
 class OAuthCallbackError extends Error {
@@ -145,7 +147,7 @@ async function consumeFlow(
     .eq("state_hash", stateHash)
     .is("consumed_at", null)
     .gt("expires_at", consumedAt)
-    .select("user_id,household_id,redirect_path");
+    .select("user_id,household_id,connection_generation,redirect_path");
 
   if (error || !Array.isArray(data) || data.length !== 1) {
     throw new OAuthCallbackError("invalid_state");
@@ -269,7 +271,7 @@ async function findUserConnection(
 ): Promise<ExistingConnection | null> {
   const { data, error } = await database
     .from("google_connections")
-    .select("id,user_id,household_id,person_id,google_account_id,refresh_token_encrypted")
+    .select("id,user_id,household_id,person_id,google_account_id,refresh_token_encrypted,oauth_generation")
     .eq("user_id", userId)
     .maybeSingle();
   if (error) throw new OAuthCallbackError("connection_failed");
@@ -293,6 +295,9 @@ async function saveConnection(
     (existing.household_id !== flow.household_id || existing.person_id !== context.personId)
   ) {
     throw new OAuthCallbackError("context_mismatch");
+  }
+  if ((existing?.oauth_generation ?? 0) !== flow.connection_generation) {
+    throw new OAuthCallbackError("invalid_state");
   }
 
   const accessTokenEncrypted = await encrypt(tokens.access_token, encryptionKey);
@@ -319,6 +324,7 @@ async function saveConnection(
     const { data, error } = await database.from("google_connections").update(credentialValues)
       .eq("id", existing.id)
       .eq("user_id", flow.user_id)
+      .eq("oauth_generation", flow.connection_generation)
       .select("id");
     if (
       error ||
@@ -369,9 +375,12 @@ export async function handleOAuthCallback(
       throw new OAuthCallbackError("invalid_request");
     }
     await verifyFlowAuthorization(database, flow, context);
+    const existing = await findUserConnection(database, flow.user_id);
+    if ((existing?.oauth_generation ?? 0) !== flow.connection_generation) {
+      throw new OAuthCallbackError("invalid_state");
+    }
     const tokens = await exchangeCode(code, context.pkceVerifier, fetchImplementation, env);
     const userinfo = await loadGoogleUser(tokens.access_token, fetchImplementation);
-    const existing = await findUserConnection(database, flow.user_id);
     if (existing && existing.google_account_id !== userinfo.sub) {
       throw new OAuthCallbackError("account_switch_requires_disconnect");
     }

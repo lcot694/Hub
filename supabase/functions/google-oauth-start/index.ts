@@ -88,6 +88,18 @@ async function verifyOwnedPerson(
   }
 }
 
+async function currentConnectionGeneration(database: SupabaseClient, userId: string): Promise<number> {
+  const { data, error } = await database.from("google_connections")
+    .select("oauth_generation").eq("user_id", userId).maybeSingle();
+  if (error) throw new HttpError(503, "oauth_unavailable", "Google connection could not be started");
+  if (!data) return 0;
+  const generation = data.oauth_generation;
+  if (!Number.isSafeInteger(generation) || generation < 0) {
+    throw new HttpError(503, "oauth_unavailable", "Google connection could not be started");
+  }
+  return generation;
+}
+
 export async function handleOAuthStart(
   req: Request,
   dependencies: OAuthStartDependencies = {},
@@ -109,6 +121,7 @@ export async function handleOAuthStart(
     const { userId } = await authenticate(req);
     const { householdId, personId } = await readInput(req);
     await verifyOwnedPerson(database, userId, householdId, personId);
+    const connectionGeneration = await currentConnectionGeneration(database, userId);
 
     const state = randomBase64Url(32);
     const pkceVerifier = randomBase64Url(64);
@@ -125,6 +138,7 @@ export async function handleOAuthStart(
     const { error: flowError } = await database.from("google_oauth_flows").insert({
       user_id: userId,
       household_id: householdId,
+      connection_generation: connectionGeneration,
       state_hash: stateHash,
       redirect_path: flowContext,
       expires_at: expiresAt,

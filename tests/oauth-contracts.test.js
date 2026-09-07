@@ -53,7 +53,7 @@ async function withDenoEnv(run) {
   }
 }
 
-function startDatabase({ membership = true, person = true, flowError = null } = {}) {
+function startDatabase({ membership = true, person = true, flowError = null, connectionGeneration = 0 } = {}) {
   const insertedFlows = [];
   return {
     insertedFlows,
@@ -77,6 +77,13 @@ function startDatabase({ membership = true, person = true, flowError = null } = 
           },
         };
       }
+      if (table === "google_connections") {
+        return {
+          select() { return this; },
+          eq() { return this; },
+          maybeSingle() { return Promise.resolve({ data: { oauth_generation: connectionGeneration }, error: null }); },
+        };
+      }
       throw new Error(`Unexpected table: ${table}`);
     },
   };
@@ -86,12 +93,15 @@ function callbackDatabase({
   flowRows = [{
     user_id: USER_ID,
     household_id: HOUSEHOLD_ID,
+    connection_generation: 0,
     redirect_path: JSON.stringify({ version: 1, personId: PERSON_ID, pkceVerifier: "v".repeat(43) }),
   }],
   membership = true,
   person = true,
   existing = null,
+  connectionUpdateRows,
 } = {}) {
+  if (existing && existing.oauth_generation === undefined) existing = { ...existing, oauth_generation: 0 };
   const calls = [];
   const writes = [];
   return {
@@ -135,14 +145,14 @@ function callbackDatabase({
             writes.push({ operation: "upsert", values: nextValues });
             return Promise.resolve({ error: null });
           },
-          eq() { return this; },
+          eq(column, value) { if (column === "oauth_generation") calls.push(["connection-generation-eq", value]); return this; },
           maybeSingle() {
             return Promise.resolve({ data: existing, error: null });
           },
           then(resolve) {
             if (operation === "update") {
               writes.push({ operation, values });
-              resolve({ data: [{ id: existing?.id }], error: null });
+              resolve({ data: connectionUpdateRows ?? [{ id: existing?.id }], error: null });
             }
           },
         };
@@ -225,6 +235,25 @@ test("OAuth start returns the exact authorization contract and ten-minute expiry
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/calendar.events",
   ]);
+});
+
+test("OAuth start snapshots the current connection generation into the flow", async () => {
+  const { handleOAuthStart } = await oauthStart;
+  const database = startDatabase({ connectionGeneration: 7 });
+  const response = await withDenoEnv(() => handleOAuthStart(new Request(
+    "https://project.supabase.co/functions/v1/google-oauth-start",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: APP_ORIGIN },
+      body: JSON.stringify({ householdId: HOUSEHOLD_ID, personId: PERSON_ID }),
+    },
+  ), {
+    authenticate: async () => ({ userId: USER_ID, accessToken: "jwt" }),
+    database, env: testEnv, now: () => NOW,
+  }));
+
+  assert.equal(response.status, 200);
+  assert.equal(database.insertedFlows[0].connection_generation, 7);
 });
 
 test("OAuth start preserves allowed-origin CORS headers on every sanitized error", async (t) => {
@@ -329,8 +358,15 @@ test("OAuth reconnect preserves the encrypted refresh token when Google omits ro
     person_id: PERSON_ID,
     google_account_id: "google-account",
     refresh_token_encrypted: "encrypted:old-refresh",
+    oauth_generation: 4,
   };
-  const database = callbackDatabase({ existing });
+  const database = callbackDatabase({
+    existing,
+    flowRows: [{
+      user_id: USER_ID, household_id: HOUSEHOLD_ID, connection_generation: 4,
+      redirect_path: JSON.stringify({ version: 1, personId: PERSON_ID, pkceVerifier: "v".repeat(43) }),
+    }],
+  });
   const google = googleFetch({ includeRefreshToken: false });
   const response = await handleOAuthCallback(
     callbackRequest(),
@@ -343,6 +379,45 @@ test("OAuth reconnect preserves the encrypted refresh token when Google omits ro
   assert.equal(database.writes[0].values.refresh_token_encrypted, "encrypted:old-refresh");
   assert.equal(database.writes[0].values.household_id, undefined);
   assert.equal(database.writes[0].values.person_id, undefined);
+});
+
+test("a flow created before disconnect is rejected before Google access", async () => {
+  const { handleOAuthCallback } = await oauthCallback;
+  const database = callbackDatabase({
+    flowRows: [{
+      user_id: USER_ID, household_id: HOUSEHOLD_ID, connection_generation: 3,
+      redirect_path: JSON.stringify({ version: 1, personId: PERSON_ID, pkceVerifier: "v".repeat(43) }),
+    }],
+    existing: {
+      id: "connection-1", user_id: USER_ID, household_id: HOUSEHOLD_ID, person_id: PERSON_ID,
+      google_account_id: "google-account", refresh_token_encrypted: null, oauth_generation: 4,
+    },
+  });
+  const google = googleFetch();
+
+  const response = await handleOAuthCallback(callbackRequest(), callbackDependencies(database, google.implementation));
+
+  assert.equal(response.headers.get("Location"), `${APP_ORIGIN}/?google=error&code=invalid_state`);
+  assert.equal(google.requests.length, 0);
+  assert.equal(database.writes.length, 0);
+});
+
+test("disconnect winning after callback validation prevents credential persistence", async () => {
+  const { handleOAuthCallback } = await oauthCallback;
+  const database = callbackDatabase({
+    existing: {
+      id: "connection-1", user_id: USER_ID, household_id: HOUSEHOLD_ID, person_id: PERSON_ID,
+      google_account_id: "google-account", refresh_token_encrypted: "encrypted:old-refresh", oauth_generation: 0,
+    },
+    connectionUpdateRows: [],
+  });
+  const google = googleFetch();
+
+  const response = await handleOAuthCallback(callbackRequest(), callbackDependencies(database, google.implementation));
+
+  assert.equal(response.headers.get("Location"), `${APP_ORIGIN}/?google=error&code=connection_failed`);
+  assert.equal(database.writes.length, 1);
+  assert.ok(database.calls.some((call) => call[0] === "connection-generation-eq" && call[1] === 0));
 });
 
 test("OAuth callback rejects switching to another Google account for the same adult", async () => {
