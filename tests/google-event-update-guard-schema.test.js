@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 
 const guardUrl = new URL("../supabase/migrations/202608270004_google_event_update_guard.sql", import.meta.url);
 const baseUrl = new URL("../supabase/migrations/202608260001_google_sync_schema.sql", import.meta.url);
+const forwardUrl = new URL("../supabase/migrations/202608270005_remove_sync_guc_upgrade.sql", import.meta.url);
 
 test("mapped event direct updates are restricted to the owning adult's person reassignment", async () => {
   const sql = await readFile(guardUrl, "utf8");
@@ -34,6 +35,30 @@ test("no migration uses a user-spoofable setting to suppress authorization or qu
   ];
   const sql = (await Promise.all(migrationNames.map((name) => readFile(new URL(`../supabase/migrations/${name}`, import.meta.url), "utf8")))).join("\n");
   assert.doesNotMatch(sql, /app\.skip_google_event_queue|set_config\s*\(/i);
+});
+
+test("a later forward migration replaces every previously installed GUC-affected routine", async () => {
+  const sql = await readFile(forwardUrl, "utf8");
+  for (const routine of [
+    "events_enqueue_google_change",
+    "save_google_backed_event",
+    "request_google_event_delete",
+    "complete_google_push_job",
+    "apply_google_pull_page",
+  ]) {
+    assert.match(sql, new RegExp(`create or replace function public\\.${routine}\\s*\\(`, "i"), `${routine} must be superseded`);
+  }
+  assert.doesNotMatch(sql, /app\.skip_google_event_queue|set_config\s*\(|current_setting\s*\(/i);
+  assert.match(sql, /security definer/ig);
+  assert.match(sql, /set search_path = public/ig);
+});
+
+test("forward replacements preserve grants for browser and service-role entry points", async () => {
+  const sql = await readFile(forwardUrl, "utf8");
+  assert.match(sql, /grant execute on function public\.save_google_backed_event\(jsonb\) to authenticated/i);
+  assert.match(sql, /grant execute on function public\.request_google_event_delete\(uuid\) to authenticated/i);
+  assert.match(sql, /grant execute on function public\.complete_google_push_job\(uuid,uuid,jsonb\) to service_role/i);
+  assert.match(sql, /grant execute on function public\.apply_google_pull_page\(uuid,jsonb,jsonb\) to service_role/i);
 });
 
 test("spoofing the removed GUC cannot authorize a direct mapped-event update", () => {
