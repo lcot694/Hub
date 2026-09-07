@@ -339,7 +339,9 @@ begin
   update public.google_calendars set sync_token=p_next_sync_token,last_synced_at=clock_timestamp(),sync_claimed_until=null,updated_at=clock_timestamp()
     where id=p_calendar_id and sync_token is null and updated_at=v_scan.expected_sync_version;
   get diagnostics v_rows = row_count; if v_rows<>1 then raise exception 'Google pull lease changed'; end if;
-  delete from public.google_pull_cancellation_guards where google_calendar_id=p_calendar_id;
+  delete from public.google_pull_cancellation_guards
+    where google_calendar_id=p_calendar_id
+      and family_event_id in (select value::uuid from jsonb_array_elements_text(p_cancellations));
   delete from public.google_pull_scans where id=v_scan.id;
 end $$;
 

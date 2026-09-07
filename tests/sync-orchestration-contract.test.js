@@ -180,4 +180,6 @@ test("pull SQL preserves omitted Google baselines and scopes full cancellations 
   assert.match(sql, /v_change#>'\{mapping\}'\s*\?\s*'last_google_updated_at'/);
   const finish = sql.slice(sql.indexOf("create or replace function public.finish_google_full_reconciliation"), sql.indexOf("create or replace function public.abort_google_full_reconciliation"));
   assert.match(finish, /e\.id\s+in\s*\(select value::uuid from jsonb_array_elements_text\(p_cancellations\)\)/);
+  assert.doesNotMatch(finish, /delete from public\.google_pull_cancellation_guards where google_calendar_id=p_calendar_id\s*;/);
+  assert.match(finish, /delete from public\.google_pull_cancellation_guards[\s\S]*family_event_id in \(select value::uuid from jsonb_array_elements_text\(p_cancellations\)\)/);
 });
