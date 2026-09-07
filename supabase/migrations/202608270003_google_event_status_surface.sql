@@ -27,8 +27,20 @@ begin
     calendar_name, calendar_writable, connection_active, sync_state, sync_error, updated_at
   )
   select m.family_event_id, e.household_id, c.user_id, cal.id,
-    cal.display_name, cal.enabled and cal.is_writable,
-    c.connection_state = 'active', m.sync_state, m.safe_error_message, clock_timestamp()
+    cal.display_name, cal.is_writable,
+    c.connection_state = 'active',
+    case
+      when m.sync_state = 'read_only' or not cal.is_writable then 'read_only'
+      when c.connection_state <> 'active' or not cal.enabled then 'needs_attention'
+      else m.sync_state
+    end,
+    case
+      when m.sync_state = 'read_only' or not cal.is_writable then coalesce(m.safe_error_message, 'Google calendar is read-only')
+      when c.connection_state <> 'active' then coalesce(m.safe_error_message, 'Google Calendar connection needs attention')
+      when not cal.enabled then coalesce(m.safe_error_message, 'Google calendar is disabled')
+      else m.safe_error_message
+    end,
+    clock_timestamp()
   from public.google_event_mappings m
   join public.events e on e.id = m.family_event_id
   join public.google_connections c on c.id = m.google_connection_id
@@ -96,8 +108,19 @@ insert into public.google_event_sync_status (
   calendar_name, calendar_writable, connection_active, sync_state, sync_error, updated_at
 )
 select m.family_event_id, e.household_id, c.user_id, cal.id, cal.display_name,
-  cal.enabled and cal.is_writable, c.connection_state='active', m.sync_state,
-  m.safe_error_message, clock_timestamp()
+  cal.is_writable, c.connection_state='active',
+  case
+    when m.sync_state = 'read_only' or not cal.is_writable then 'read_only'
+    when c.connection_state <> 'active' or not cal.enabled then 'needs_attention'
+    else m.sync_state
+  end,
+  case
+    when m.sync_state = 'read_only' or not cal.is_writable then coalesce(m.safe_error_message, 'Google calendar is read-only')
+    when c.connection_state <> 'active' then coalesce(m.safe_error_message, 'Google Calendar connection needs attention')
+    when not cal.enabled then coalesce(m.safe_error_message, 'Google calendar is disabled')
+    else m.safe_error_message
+  end,
+  clock_timestamp()
 from public.google_event_mappings m
 join public.events e on e.id=m.family_event_id
 join public.google_connections c on c.id=m.google_connection_id
@@ -112,7 +135,19 @@ returns table (
 )
 language sql stable security definer set search_path = public as $$
   select e.household_id, m.family_event_id, cal.id, cal.display_name,
-    cal.is_writable, m.sync_state, m.safe_error_message, c.user_id,
+    cal.is_writable,
+    case
+      when m.sync_state = 'read_only' or not cal.is_writable then 'read_only'
+      when c.connection_state <> 'active' or not cal.enabled then 'needs_attention'
+      else m.sync_state
+    end,
+    case
+      when m.sync_state = 'read_only' or not cal.is_writable then coalesce(m.safe_error_message, 'Google calendar is read-only')
+      when c.connection_state <> 'active' then coalesce(m.safe_error_message, 'Google Calendar connection needs attention')
+      when not cal.enabled then coalesce(m.safe_error_message, 'Google calendar is disabled')
+      else m.safe_error_message
+    end,
+    c.user_id,
     c.user_id = auth.uid() as mapping_owned,
     c.user_id = auth.uid() and c.connection_state='active'
       and cal.enabled and cal.is_writable and m.sync_state <> 'read_only' as mapping_can_edit

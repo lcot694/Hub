@@ -757,6 +757,7 @@ begin
     return;
   end if;
 
+  perform set_config('app.skip_google_event_queue', 'on', true);
   update public.events
   set sync_deleted_at = clock_timestamp()
   where id = p_family_event_id

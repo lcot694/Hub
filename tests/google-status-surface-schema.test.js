@@ -23,3 +23,12 @@ test("safe household status surface is realtime-published and maintained by mapp
   assert.match(sql, /alter publication supabase_realtime add table public\.google_event_sync_status/i);
   assert.doesNotMatch(sql, /google_event_id|google_etag|display_email|token/i);
 });
+
+test("effective status cannot remain synced when its connection or calendar is unavailable", async () => {
+  const sql = await readFile(migrationUrl, "utf8");
+  assert.match(sql, /when m\.sync_state\s*=\s*'read_only'\s+or not cal\.is_writable then 'read_only'/i);
+  assert.match(sql, /when c\.connection_state\s*<>\s*'active'\s+or not cal\.enabled then 'needs_attention'/i);
+  assert.match(sql, /Google Calendar connection needs attention/i);
+  assert.match(sql, /Google calendar is disabled/i);
+  assert.match(sql, /Google calendar is read-only/i);
+});
