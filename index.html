@@ -115,19 +115,24 @@
       <form id="eventForm" class="form">
         <label>Event<input id="eventTitle" required></label>
         <label>Family member<select id="eventPerson" required></select></label>
+        <label>Calendar<select id="eventCalendar"></select></label>
+        <label class="check-row"><input id="eventAllDay" type="checkbox"> All-day event</label>
         <div class="quick-row">
           <label>Date<input id="eventDate" type="date" required></label>
-          <label>Time<input id="eventTime" type="time" required></label>
+          <label id="eventTimeWrap">Time<input id="eventTime" type="time" required></label>
         </div>
-        <label>Ends at<input id="eventEndTime" type="time"></label>
+        <label id="eventEndTimeWrap">Ends at<input id="eventEndTime" type="time"></label>
         <label>Repeats
           <select id="eventRepeat">
             <option value="none">Does not repeat</option>
             <option value="daily">Every day</option>
             <option value="weekly">Every week</option>
+            <option value="monthly">Every month</option>
+            <option value="yearly">Every year</option>
           </select>
         </label>
         <label id="repeatEndWrap" class="hidden">Repeat until<input id="eventRepeatEnd" type="date"></label>
+        <div id="eventSyncStatus" class="event-sync-dialog hidden" aria-live="polite"></div>
         <div class="modal-actions">
           <button class="btn" type="button" data-close="eventDialog">Cancel</button>
           <button class="btn primary" type="submit">Save event</button>

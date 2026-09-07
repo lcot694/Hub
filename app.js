@@ -1,6 +1,9 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { toISO, parseISO, occursOn, eventsFor } from "./lib/calendar-domain.js";
-import { createGoogleSettings } from "./lib/google-ui.js";
+import {
+  FAMILY_HUB_ONLY, createGoogleSettings, editPermissions, eventWritePlan,
+  googleDeleteWarning, syncPresentation, visibleEvents,
+} from "./lib/google-ui.js";
 
 const cfg = window.FAMILY_HUB_CONFIG || {};
 if (!cfg.SUPABASE_URL || cfg.SUPABASE_URL.includes("PASTE_")) {
@@ -23,6 +26,9 @@ let currentUser = null, household = null, people = [], rawEvents = [], view = "w
 let cursor = new Date();
 let realtimeChannel = null;
 let editingEventId = null;
+let googleStatusByEvent = new Map();
+let loadGeneration = 0;
+let dialogGeneration = 0;
 
 function showScreen(name){
   Object.values(ui).forEach(x=>x.classList.add("hidden"));
@@ -56,6 +62,7 @@ async function loadHousehold(){
   subscribeRealtime();
   showScreen("app");
   render();
+  googleSettings.load().catch(() => {});
   googleSettings.requestSync("app_open").catch(() => {});
   if(new URLSearchParams(location.search).get("google")==="connected"){
     googleSettings.load();
@@ -63,19 +70,25 @@ async function loadHousehold(){
   }
 }
 async function loadData(){
+  const generation=++loadGeneration;
   setSync("Syncing…",false);
-  const [{data:p,error:pe},{data:e,error:ee}] = await Promise.all([
+  const [{data:p,error:pe},{data:e,error:ee},{data:s,error:se}] = await Promise.all([
     supabase.from("people").select("*").eq("household_id",household.id).order("sort_order"),
-    supabase.from("events").select("*").eq("household_id",household.id).order("event_date")
+    supabase.from("events").select("*").eq("household_id",household.id).order("event_date"),
+    supabase.rpc("get_google_sync_status")
   ]);
-  if(pe||ee){console.error(pe||ee);setSync("Sync error",false);return}
-  people=p||[];rawEvents=e||[];setSync("Connected",true);
+  if(generation!==loadGeneration)return;
+  if(pe||ee||se){console.error(pe||ee||se);setSync("Sync error",false);return}
+  people=p||[];rawEvents=visibleEvents(e||[]);
+  googleStatusByEvent=new Map((s||[]).filter(x=>x.family_event_id).map(x=>[x.family_event_id,x]));
+  setSync("Connected",true);
 }
 function subscribeRealtime(){
   if(realtimeChannel) supabase.removeChannel(realtimeChannel);
   realtimeChannel=supabase.channel(`household-${household.id}`)
     .on("postgres_changes",{event:"*",schema:"public",table:"events",filter:`household_id=eq.${household.id}`}, async()=>{await loadData();render()})
     .on("postgres_changes",{event:"*",schema:"public",table:"people",filter:`household_id=eq.${household.id}`}, async()=>{await loadData();render()})
+    .on("postgres_changes",{event:"*",schema:"public",table:"google_event_mappings"}, async()=>{await loadData();render()})
     .subscribe();
 }
 function setSync(text,ok=true){if(!$("syncText"))return;$("syncText").textContent=text;$("syncDot").style.background=ok?"#4f9d69":"#c6923c"}
@@ -115,8 +128,20 @@ const googleSettings=createGoogleSettings({
   supabase,
   root:$("googleSettings"),
   getContext:()=>({householdId:household?.id,people}),
-  onChanged:()=>{}
+  onChanged:()=>{fillEventCalendars($("eventCalendar").value||FAMILY_HUB_ONLY)}
 });
+
+function fillEventCalendars(selected=FAMILY_HUB_ONLY,fallbackLabel="Google Calendar"){
+  const select=$("eventCalendar");
+  select.replaceChildren();
+  for(const option of googleSettings.calendarDestinationOptions()){
+    const node=document.createElement("option");node.value=option.value;node.textContent=option.label;select.append(node);
+  }
+  if(selected!==FAMILY_HUB_ONLY&&![...select.options].some(option=>option.value===selected)){
+    const node=document.createElement("option");node.value=selected;node.textContent=fallbackLabel;select.append(node);
+  }
+  if([...select.options].some(option=>option.value===selected))select.value=selected;
+}
 
 function fillPersonSelects(){
   ["quickPerson","eventPerson"].forEach(id=>{
@@ -139,7 +164,7 @@ function eventCard(e){
 
   el.innerHTML=`
     <div class="event-time">
-      ${fmtTime(e.start_time)}
+      ${e.all_day ? "All day" : fmtTime(e.start_time)}
       ${e.end_time ? " – "+fmtTime(e.end_time) : ""}
       ${e.recurrence!=="none" ? " ↻" : ""}
     </div>
@@ -149,6 +174,7 @@ function eventCard(e){
 
   el.querySelector(".event-title").textContent=e.title;
   el.querySelector(".event-person").textContent=p.name;
+  appendSyncStatus(el,googleStatusByEvent.get(e.id));
 
   el.onclick=ev=>{
     ev.stopPropagation();
@@ -156,6 +182,18 @@ function eventCard(e){
   };
 
   return el;
+}
+
+function appendSyncStatus(container,mapping,{dialog=false}={}){
+  const presentation=syncPresentation(mapping);if(!presentation)return;
+  const status=document.createElement("div");
+  status.className=dialog?"event-sync-dialog":`event-sync ${mapping.sync_state.replaceAll("_","-")}`;
+  status.setAttribute("role","status");
+  const label=document.createElement("span");label.textContent=presentation.label;status.append(label);
+  if(mapping.calendar_name){const calendar=document.createElement("span");calendar.textContent=` · ${mapping.calendar_name}`;status.append(calendar)}
+  if(presentation.retryable&&mapping.sync_error){const error=document.createElement("span");error.textContent=` · ${mapping.sync_error}`;status.append(error)}
+  if(presentation.retryable){const retry=document.createElement("button");retry.type="button";retry.className="btn";retry.textContent="Retry";retry.setAttribute("aria-label","Retry Google Calendar sync");retry.onclick=async ev=>{ev?.stopPropagation();retry.disabled=true;try{await googleSettings.requestSync("manual")}finally{retry.disabled=false}};status.append(retry)}
+  container.append(status);
 }
 
 function renderWeek(){
@@ -177,7 +215,7 @@ function renderMonth(){
   const y=cursor.getFullYear(),m=cursor.getMonth(),start=startOfWeek(new Date(y,m,1));$("rangeLabel").textContent=new Intl.DateTimeFormat("en-CA",{month:"long",year:"numeric"}).format(cursor);
   const wrap=document.createElement("div");wrap.className="month";["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].forEach(x=>{const h=document.createElement("div");h.className="month-head";h.textContent=x;wrap.appendChild(h)});
   for(let i=0;i<42;i++){const d=addDays(start,i),cell=document.createElement("div");cell.className="month-day"+(d.getMonth()!==m?" outside":"")+(sameDay(d,new Date())?" today":"");cell.innerHTML=`<div class="month-num">${d.getDate()}</div>`;
-    const es=eventsFor(rawEvents,d);es.slice(0,3).forEach(e=>{const p=getPerson(e.person_id),x=document.createElement("div");x.className="month-event";x.style.setProperty("--event-color",p.color);x.textContent=`${fmtTime(e.start_time)} ${e.title}`;
+    const es=eventsFor(rawEvents,d);es.slice(0,3).forEach(e=>{const p=getPerson(e.person_id),x=document.createElement("div");x.className="month-event";x.style.setProperty("--event-color",p.color);x.textContent=`${e.all_day?"All day":fmtTime(e.start_time)} ${e.title}`;
 x.style.cursor="pointer";
 x.title="Click to edit";
 
@@ -191,7 +229,7 @@ cell.appendChild(x)});if(es.length>3)cell.insertAdjacentHTML("beforeend",`<div c
 }
 function renderToday(){
   const el=$("todayList");el.innerHTML="";const es=eventsFor(rawEvents,new Date());if(!es.length){el.innerHTML='<div class="empty">Nothing scheduled today.</div>';return}
-  es.forEach(e=>{const p=getPerson(e.person_id),row=document.createElement("div");row.className="today-row";row.innerHTML=`<div class="today-time">${fmtTime(e.start_time)}</div><div><div class="today-name"></div><div class="event-person"><span class="dot" style="background:${p.color};margin-right:5px"></span>${p.name}</div></div>`;row.querySelector(".today-name").textContent=e.title;
+  es.forEach(e=>{const p=getPerson(e.person_id),row=document.createElement("div");row.className="today-row";row.innerHTML=`<div class="today-time">${e.all_day?"All day":fmtTime(e.start_time)}</div><div><div class="today-name"></div><div class="event-person"><span class="dot" style="background:${p.color};margin-right:5px"></span>${p.name}</div></div>`;row.querySelector(".today-name").textContent=e.title;
 row.style.cursor="pointer";
 row.title="Click to edit";
 row.onclick=()=>openEdit(e);
@@ -219,30 +257,37 @@ function ensureEditButton(){
 
     btn.onclick=async()=>{
       if(!editingEventId)return;
-
       const current=rawEvents.find(e=>e.id===editingEventId);
+
+      const mapping=googleStatusByEvent.get(editingEventId);
+      const permissions=editPermissions(mapping);
+      if(mapping&&!permissions.deleteEverywhere)return;
 
       const recurring=current?.recurrence!=="none"
         ? " This will delete the entire repeating series."
         : "";
 
-      if(!confirm(`Delete "${current?.title}"?${recurring}`))return;
+      const warning=mapping
+        ? googleDeleteWarning({title:current?.title||"event",calendarName:mapping.calendar_name||"Google Calendar"})
+        : `Delete "${current?.title}"?${recurring}`;
+      if(!confirm(warning))return;
 
       setSync("Deleting…",false);
-
-      const {error}=await supabase
-        .from("events")
-        .delete()
-        .eq("id",editingEventId);
+      btn.disabled=true;
+      const eventId=editingEventId,generation=dialogGeneration;
+      const {error}=mapping
+        ? await supabase.rpc("request_google_event_delete",{p_family_event_id:eventId})
+        : await supabase.from("events").delete().eq("id",eventId);
+      if(generation===dialogGeneration)btn.disabled=false;
 
       if(error){
+        if(generation!==dialogGeneration)return;
         alert(error.message);
         setSync("Delete error",false);
         return;
       }
 
-      editingEventId=null;
-      $("eventDialog").close();
+      if(generation===dialogGeneration&&editingEventId===eventId){editingEventId=null;$("eventDialog").close()}
     };
 
     actions.prepend(btn);
@@ -267,7 +312,30 @@ function setEventDialogMode(mode){
   }
 }
 
+function setAllDayControls(){
+  const allDay=$("eventAllDay").checked;
+  $("eventTimeWrap").classList.toggle("hidden",allDay);$("eventEndTimeWrap").classList.toggle("hidden",allDay);
+  $("eventTime").required=!allDay;
+}
+
+function setGoogleFieldPermissions(mapping){
+  const permissions=editPermissions(mapping);
+  $("eventTitle").disabled=!permissions.title;
+  ["eventCalendar","eventAllDay","eventDate"].forEach(id=>{$(id).disabled=!permissions.date});
+  ["eventTime","eventEndTime"].forEach(id=>{$(id).disabled=!permissions.times});
+  ["eventRepeat","eventRepeatEnd"].forEach(id=>{$(id).disabled=!permissions.recurrence});
+  $("eventPerson").disabled=false;
+  $("deleteEventBtn").disabled=!permissions.deleteEverywhere;
+  $("deleteEventBtn").title=permissions.deleteEverywhere?"":"Read-only Google events cannot be deleted from Family Hub";
+}
+
+function renderDialogSyncStatus(mapping){
+  const holder=$("eventSyncStatus");holder.replaceChildren();holder.classList.add("hidden");
+  if(mapping){holder.classList.remove("hidden");appendSyncStatus(holder,mapping,{dialog:true})}
+}
+
 function openAdd(d=new Date()){
+  dialogGeneration++;
   editingEventId=null;
   setEventDialogMode("add");
 
@@ -275,9 +343,11 @@ function openAdd(d=new Date()){
   $("eventDate").value=toISO(d);
   $("eventTime").value="17:00";
   $("eventEndTime").value="";
+  $("eventAllDay").checked=false;
   $("eventRepeat").value="none";
   $("eventRepeatEnd").value="";
   $("repeatEndWrap").classList.add("hidden");
+  fillEventCalendars();setGoogleFieldPermissions(null);renderDialogSyncStatus(null);setAllDayControls();
 
   if(people.length){
     $("eventPerson").value=people[0].id;
@@ -287,6 +357,7 @@ function openAdd(d=new Date()){
 }
 
 function openEdit(e){
+  dialogGeneration++;
   editingEventId=e.id;
   setEventDialogMode("edit");
 
@@ -295,6 +366,7 @@ function openEdit(e){
   $("eventDate").value=e.event_date;
   $("eventTime").value=(e.start_time || "").slice(0,5);
   $("eventEndTime").value=(e.end_time || "").slice(0,5);
+  $("eventAllDay").checked=Boolean(e.all_day);
   $("eventRepeat").value=e.recurrence || "none";
   $("eventRepeatEnd").value=e.recurrence_end || "";
 
@@ -302,10 +374,14 @@ function openEdit(e){
     "hidden",
     (e.recurrence || "none")==="none"
   );
+  const mapping=googleStatusByEvent.get(e.id);
+  fillEventCalendars(mapping?.google_calendar_id||FAMILY_HUB_ONLY,mapping?.calendar_name);
+  setGoogleFieldPermissions(mapping);if(mapping)$("eventCalendar").disabled=true;
+  renderDialogSyncStatus(mapping);setAllDayControls();
 
   $("eventDialog").showModal();
 }
-document.querySelectorAll("[data-close]").forEach(b=>b.onclick=()=>$(b.dataset.close).close());
+document.querySelectorAll("[data-close]").forEach(b=>b.onclick=()=>{if(b.dataset.close==="eventDialog")dialogGeneration++;$(b.dataset.close).close()});
 document.querySelectorAll(".view-switch button").forEach(b=>b.onclick=()=>{view=b.dataset.view;render()});
 $("todayBtn").onclick=()=>{cursor=new Date();render()};
 $("prevBtn").onclick=()=>{cursor=view==="month"?new Date(cursor.getFullYear(),cursor.getMonth()-1,1):addDays(cursor,view==="week"?-7:-1);render()};
@@ -315,18 +391,33 @@ $("familyBtn").onclick=()=>{renderPeople();googleSettings.load();$("familyDialog
 $("shareBtn").onclick=()=>{$("shareCode").textContent=household.join_code;$("shareDialog").showModal()};
 $("copyCodeBtn").onclick=async()=>{await navigator.clipboard.writeText(household.join_code);$("copyCodeBtn").textContent="Copied!";setTimeout(()=>$("copyCodeBtn").textContent="Copy code",1200)};
 $("eventRepeat").onchange=()=>{$("repeatEndWrap").classList.toggle("hidden",$("eventRepeat").value==="none")};
+$("eventAllDay").onchange=setAllDayControls;
 $("eventForm").onsubmit=async e=>{
   e.preventDefault();
-
+  const saveButton=$("eventForm").querySelector('button[type="submit"]');
+  const eventId=editingEventId,generation=dialogGeneration;
+  const mapping=eventId?googleStatusByEvent.get(eventId):null;
   setSync(editingEventId ? "Updating…" : "Saving…",false);
+
+  if(mapping&&!editPermissions(mapping).title){
+    saveButton.disabled=true;
+    const result=await supabase.from("events").update({person_id:$("eventPerson").value||null}).eq("id",eventId);
+    if(generation!==dialogGeneration)return;
+    saveButton.disabled=false;
+    if(result.error){alert(result.error.message);setSync("Update error",false);return}
+    if(generation===dialogGeneration&&editingEventId===eventId){editingEventId=null;$("eventDialog").close()}
+    return;
+  }
 
   const payload={
     household_id:household.id,
+    ...(eventId?{id:eventId}:{}),
     person_id:$("eventPerson").value||null,
     title:$("eventTitle").value.trim(),
     event_date:$("eventDate").value,
-    start_time:$("eventTime").value||null,
-    end_time:$("eventEndTime").value||null,
+    start_time:$("eventAllDay").checked?null:($("eventTime").value||null),
+    end_time:$("eventAllDay").checked?null:($("eventEndTime").value||null),
+    all_day:$("eventAllDay").checked,
     recurrence:$("eventRepeat").value,
     recurrence_end:
       $("eventRepeat").value==="none"
@@ -334,21 +425,17 @@ $("eventForm").onsubmit=async e=>{
         : ($("eventRepeatEnd").value||null)
   };
 
+  const plan=eventWritePlan(payload,$("eventCalendar").value,eventId!==null);
+  saveButton.disabled=true;
   let result;
-
-  if(editingEventId){
-    result=await supabase
-      .from("events")
-      .update(payload)
-      .eq("id",editingEventId);
-  }else{
-    result=await supabase
-      .from("events")
-      .insert({
-        ...payload,
-        created_by:currentUser.id
-      });
+  if(plan.kind==="google-rpc")result=await supabase.rpc(plan.functionName,plan.args);
+  else if(plan.kind==="family-update"){
+    const {id:_eventId,...familyPayload}=plan.payload;
+    result=await supabase.from("events").update(familyPayload).eq("id",eventId);
   }
+  else result=await supabase.from("events").insert({...plan.payload,created_by:currentUser.id});
+  if(generation!==dialogGeneration)return;
+  saveButton.disabled=false;
 
   if(result.error){
     alert(result.error.message);
@@ -356,8 +443,7 @@ $("eventForm").onsubmit=async e=>{
     return;
   }
 
-  editingEventId=null;
-  $("eventDialog").close();
+  if(generation===dialogGeneration&&editingEventId===eventId){editingEventId=null;$("eventDialog").close()}
 };
 $("quickForm").onsubmit=async e=>{
   e.preventDefault();const {error}=await supabase.from("events").insert({household_id:household.id,person_id:$("quickPerson").value||null,title:$("quickTitle").value.trim(),event_date:$("quickDate").value,start_time:$("quickTime").value||null,recurrence:"none",created_by:currentUser.id});
