@@ -102,6 +102,17 @@ export interface PushCompletion {
   };
   reconcileGoogleEvent?: GooglePushEvent;
   reconcileFamilyEvent?: Record<string, unknown>;
+  /**
+   * Atomically mark the existing mapping read-only and complete the job without
+   * reconciling Family data or recording a synced baseline.
+   */
+  unsupportedGoogleContent?: {
+    google_event_id: string;
+    google_etag: string;
+    google_updated_at: string;
+    sync_state: "read_only";
+    safe_error_message: string;
+  };
   /** Atomically copy the reconciled event row's updated_at into the mapping. */
   captureReconciledFamilyUpdatedAt?: true;
 }
@@ -312,19 +323,36 @@ interface RemoteWriteOutcome {
   finalizeLocalDelete: boolean;
   reconcileGoogleEvent?: GooglePushEvent;
   reconcileFamilyEvent?: Record<string, unknown>;
+  unsupportedGoogleContent?: NonNullable<PushCompletion["unsupportedGoogleContent"]>;
 }
 
 function translatedGoogleEvent(
   context: PushContext,
   event: GooglePushEvent,
-): Record<string, unknown> {
+): { event?: Record<string, unknown>; readOnlyReason?: string } {
   const translated = googleToFamilyEvent(event, {
     householdId: context.familyEvent.household_id,
     defaultPersonId: context.familyEvent.person_id,
     householdTimeZone: context.householdTimeZone,
   });
-  if (!translated.supported) throw new GooglePushError("validation", 409);
-  return translated.event as Record<string, unknown>;
+  if (!translated.supported) return { readOnlyReason: translated.readOnlyReason };
+  return { event: translated.event as Record<string, unknown> };
+}
+
+function unsupportedGoogleContent(
+  event: GooglePushEvent,
+  readOnlyReason: string | undefined,
+): NonNullable<PushCompletion["unsupportedGoogleContent"]> {
+  const safeErrorMessage = readOnlyReason === "complex_recurrence"
+    ? "Google event has an unsupported recurrence pattern"
+    : "Google event has unsupported content";
+  return {
+    google_event_id: event.id,
+    google_etag: event.etag,
+    google_updated_at: event.updated,
+    sync_state: "read_only",
+    safe_error_message: safeErrorMessage,
+  };
 }
 
 async function updateAfterConflict(
@@ -376,17 +404,24 @@ async function resolveFetchedEvent(
 
   const confirmed = assertConfirmedEvent(fetched, eventId);
   const conflictWinner = chooseConflictWinner(context.mapping, context.familyEvent, confirmed);
-  const reconcileFamilyEvent = translatedGoogleEvent(context, confirmed);
   if (conflictWinner === "family") {
     const event = await updateAfterConflict(context, dependencies, eventId, payload, confirmed.etag);
     return { event, conflictWinner, finalizeLocalDelete: false };
+  }
+  const translated = translatedGoogleEvent(context, confirmed);
+  if (!translated.event) {
+    return {
+      conflictWinner,
+      finalizeLocalDelete: false,
+      unsupportedGoogleContent: unsupportedGoogleContent(confirmed, translated.readOnlyReason),
+    };
   }
   return {
     event: confirmed,
     conflictWinner,
     finalizeLocalDelete: false,
     reconcileGoogleEvent: confirmed,
-    reconcileFamilyEvent,
+    reconcileFamilyEvent: translated.event,
   };
 }
 
@@ -410,6 +445,12 @@ function completionForOutcome(
   outcome: RemoteWriteOutcome,
 ): PushCompletion {
   if (outcome.finalizeLocalDelete) return { finalizeLocalDelete: true };
+  if (outcome.unsupportedGoogleContent) {
+    return {
+      finalizeLocalDelete: false,
+      unsupportedGoogleContent: outcome.unsupportedGoogleContent,
+    };
+  }
   if (!outcome.event) throw new GooglePushError("transient", 503);
 
   const confirmedMapping = mappingConfirmation(familyEvent, outcome.event);
@@ -552,10 +593,13 @@ export async function processPushJob(
       await deleteRemoteEvent(context, dependencies, eventId);
       completion = { finalizeLocalDelete: true };
     } else {
-      const payload = familyToGoogleEvent(context.familyEvent, {
+      const basePayload = familyToGoogleEvent(context.familyEvent, {
         householdId: context.familyEvent.household_id,
         householdTimeZone: context.householdTimeZone,
       }) as Record<string, unknown>;
+      const payload = job.operation === "update" && context.familyEvent.recurrence === "none"
+        ? { ...basePayload, recurrence: [] }
+        : basePayload;
       if (job.operation === "create") {
         const created = await createRemoteEvent(job, context, dependencies, eventId, payload);
         conflictWinner = created.conflictWinner;

@@ -22,6 +22,14 @@ const STABLE_GOOGLE_ID = "fh12345678123442348234123456789abc";
 const NOW = "2026-08-27T14:00:00.000Z";
 const TEST_KEY = Buffer.alloc(32, 9).toString("base64");
 
+function testEnvironment(name) {
+  return {
+    GOOGLE_TOKEN_ENCRYPTION_KEY: TEST_KEY,
+    GOOGLE_CLIENT_ID: "test-client",
+    GOOGLE_CLIENT_SECRET: "test-secret",
+  }[name];
+}
+
 function job(operation = "create", overrides = {}) {
   return {
     id: "job-1",
@@ -184,6 +192,45 @@ test("update sends the stored ETag in If-Match and updates observed timestamps",
   assert.equal(call(deps, "complete")[3].mapping.last_google_updated_at, "2026-08-27T14:00:01.000Z");
 });
 
+test("a conditional update clears Google recurrence before completing its mapping", async () => {
+  const { createGooglePushAdapter, processPushJob } = await pushWorker;
+  const { encryptToken } = await tokenCrypto;
+  let releaseResponse;
+  let observeRequest;
+  const requestSeen = new Promise((resolve) => { observeRequest = resolve; });
+  const active = context({ connection: {
+    access_token_encrypted: await encryptToken("active-access", TEST_KEY),
+    refresh_token_encrypted: await encryptToken("active-refresh", TEST_KEY),
+    token_expires_at: "2099-01-01T00:00:00.000Z",
+  } });
+  const google = createGooglePushAdapter({
+    env: testEnvironment,
+    fetch: async (input) => {
+      observeRequest(input);
+      return await new Promise((resolve) => { releaseResponse = resolve; });
+    },
+  });
+  const deps = fakeDeps({ context: active, google });
+
+  const processing = processPushJob(job("update"), deps);
+  const request = await requestSeen;
+
+  assert.equal(request.method, "PATCH");
+  assert.deepEqual(await request.clone().json(), {
+    summary: "Soccer",
+    start: { dateTime: "2026-09-02T18:00:00", timeZone: "America/Toronto" },
+    end: { dateTime: "2026-09-02T19:00:00", timeZone: "America/Toronto" },
+    recurrence: [],
+  });
+  assert.equal(call(deps, "complete"), undefined);
+
+  releaseResponse(Response.json(googleEvent()));
+  const result = await processing;
+
+  assert.equal(result.status, "complete");
+  assert.equal(call(deps, "complete")[3].mapping.google_etag, '"etag-after"');
+});
+
 test("a 412 update fetches current state and keeps a newer Google event", async () => {
   const { GooglePushError, processPushJob } = await pushWorker;
   const remote = googleEvent({ updated: "2026-08-27T15:00:00.000Z", etag: '"google-newer"' });
@@ -210,6 +257,87 @@ test("a 412 update fetches current state and keeps a newer Google event", async 
   assert.equal(completion.captureReconciledFamilyUpdatedAt, true);
   assert.equal("last_family_updated_at" in completion.mapping, false,
     "the store must capture the post-reconciliation database timestamp, not reuse the stale pre-conflict value");
+});
+
+test("a Family winner conditionally updates unsupported fetched Google content with its ETag", async () => {
+  const { GooglePushError, processPushJob } = await pushWorker;
+  const unsupported = googleEvent({
+    recurrence: ["RRULE:FREQ=WEEKLY", "EXDATE;VALUE=DATE:20260909"],
+    updated: "2026-08-26T11:00:00.000Z",
+    etag: '"unsupported-before"',
+  });
+  let attempts = 0;
+  const deps = fakeDeps({ google: {
+    update: async (...args) => {
+      deps.calls.push(["update", ...args]);
+      attempts += 1;
+      if (attempts === 1) throw new GooglePushError("validation", 412);
+      return googleEvent({ etag: '"confirmed-after"' });
+    },
+    get: async (...args) => {
+      deps.calls.push(["get", ...args]);
+      return unsupported;
+    },
+  } });
+
+  const result = await processPushJob(job("update"), deps);
+
+  assert.deepEqual(result, {
+    status: "complete",
+    finalizeLocalDelete: false,
+    conflictWinner: "family",
+  });
+  const retry = deps.calls.filter(([name]) => name === "update")[1];
+  assert.deepEqual(retry[5], {
+    summary: "Soccer",
+    start: { dateTime: "2026-09-02T18:00:00", timeZone: "America/Toronto" },
+    end: { dateTime: "2026-09-02T19:00:00", timeZone: "America/Toronto" },
+    recurrence: [],
+  });
+  assert.deepEqual(retry[6], { ifMatch: '"unsupported-before"' });
+  assert.equal(call(deps, "complete")[3].mapping.google_etag, '"confirmed-after"');
+  assert.equal("unsupportedGoogleContent" in call(deps, "complete")[3], false);
+});
+
+test("a Google winner marks unsupported fetched content read-only without overwriting Family state", async () => {
+  const { GooglePushError, processPushJob } = await pushWorker;
+  const unsupported = googleEvent({
+    summary: "Remote private subject",
+    recurrence: ["RRULE:FREQ=WEEKLY", "EXDATE;VALUE=DATE:20260909"],
+    updated: "2026-08-27T15:00:00.000Z",
+    etag: '"unsupported-google-winner"',
+  });
+  const deps = fakeDeps({ google: {
+    update: async (...args) => {
+      deps.calls.push(["update", ...args]);
+      throw new GooglePushError("validation", 412);
+    },
+    get: async (...args) => {
+      deps.calls.push(["get", ...args]);
+      return unsupported;
+    },
+  } });
+
+  const result = await processPushJob(job("update"), deps);
+
+  assert.deepEqual(result, {
+    status: "complete",
+    finalizeLocalDelete: false,
+    conflictWinner: "google",
+  });
+  assert.equal(deps.calls.filter(([name]) => name === "update").length, 1);
+  const completion = call(deps, "complete")[3];
+  assert.deepEqual(completion.unsupportedGoogleContent, {
+    google_event_id: STABLE_GOOGLE_ID,
+    google_etag: '"unsupported-google-winner"',
+    google_updated_at: "2026-08-27T15:00:00.000Z",
+    sync_state: "read_only",
+    safe_error_message: "Google event has an unsupported recurrence pattern",
+  });
+  assert.equal("mapping" in completion, false);
+  assert.equal("reconcileGoogleEvent" in completion, false);
+  assert.equal("reconcileFamilyEvent" in completion, false);
+  assert.doesNotMatch(JSON.stringify(completion), /Remote private subject/);
 });
 
 test("a 412 update retries once with the fresh ETag when Family Hub wins", async () => {
@@ -514,13 +642,8 @@ test("the real Google adapter refreshes a 401 once and feeds its retry into work
     refresh_token_encrypted: await encryptToken("old-refresh", TEST_KEY),
     token_expires_at: "2099-01-01T00:00:00.000Z",
   } });
-  const environment = (name) => ({
-    GOOGLE_TOKEN_ENCRYPTION_KEY: TEST_KEY,
-    GOOGLE_CLIENT_ID: "test-client",
-    GOOGLE_CLIENT_SECRET: "test-secret",
-  })[name];
   const google = createGooglePushAdapter({
-    env: environment,
+    env: testEnvironment,
     now: () => new Date(NOW),
     persistTokens: async (owner, tokens) => { persisted = { owner, tokens }; },
     fetch: async (input, init) => {
