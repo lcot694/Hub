@@ -63,13 +63,41 @@ interface GoogleTokenResponse {
 export class GoogleApiError extends Error {
   readonly category: GoogleErrorCategory;
   readonly status: number;
+  readonly reason?: string;
 
-  constructor(category: GoogleErrorCategory, status: number, message = "Google API request failed") {
+  constructor(
+    category: GoogleErrorCategory,
+    status: number,
+    message = "Google API request failed",
+    reason?: string,
+  ) {
     super(message);
     this.name = "GoogleApiError";
     this.category = category;
     this.status = status;
+    this.reason = reason;
   }
+}
+
+const RATE_LIMIT_REASONS = new Set(["rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded"]);
+
+async function googleResponseError(response: Response): Promise<GoogleApiError> {
+  let reason: string | undefined;
+  if (response.status === 403) {
+    try {
+      const body = await response.clone().json() as { error?: { errors?: Array<{ reason?: unknown }> } };
+      const candidate = body?.error?.errors?.[0]?.reason;
+      if (typeof candidate === "string" && RATE_LIMIT_REASONS.has(candidate)) reason = candidate;
+    } catch {
+      // A malformed error body remains a normal sanitized permission failure.
+    }
+  }
+  return new GoogleApiError(
+    reason ? "rate_limit" : classifyGoogleStatus(response.status),
+    response.status,
+    "Google API request failed",
+    reason,
+  );
 }
 
 export function classifyGoogleStatus(status: number): GoogleErrorCategory {
@@ -247,7 +275,7 @@ export async function googleFetch(
   }
 
   if (!response.ok) {
-    throw new GoogleApiError(classifyGoogleStatus(response.status), response.status);
+    throw await googleResponseError(response);
   }
   return response;
 }

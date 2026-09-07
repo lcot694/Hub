@@ -20,6 +20,8 @@ export interface PullCalendar {
   enabled: boolean;
   is_writable: boolean;
   sync_token: string | null;
+  /** Opaque calendar-row version used with the sync token as a pull CAS. */
+  sync_version: string;
   time_zone: string | null;
   ownerUserId: string;
   householdTimeZone: string;
@@ -55,6 +57,8 @@ export interface PullMapping {
   google_connection_id: string;
   google_calendar_id: string;
   google_event_id: string;
+  created_at: string;
+  updated_at: string;
   google_etag: string | null;
   google_updated_at: string | null;
   last_family_updated_at: string | null;
@@ -81,7 +85,21 @@ export interface PullFamilyEvent {
 export interface MappedPullEvent {
   mapping: PullMapping;
   familyEvent: PullFamilyEvent;
+  /**
+   * Last modification time of Google-owned Family fields. Stores can derive it
+   * from an unsynchronized create/update/delete queue row; without one they use
+   * the mapping baseline, so person-only edits do not become Google conflicts.
+   */
+  syncRelevantFamilyUpdatedAt: string | null;
 }
+
+export interface PullChangeExpectation {
+  mappingUpdatedAt: string;
+  familyUpdatedAt: string;
+}
+
+/** Queue mutation performed in the same transaction as its event and mapping change. */
+export type PullQueuePolicy = "none" | "ensure_update" | "supersede_pending";
 
 interface MappingObservation {
   google_etag: string | null;
@@ -98,6 +116,8 @@ export interface ImportPullChange {
   familyEvent: Record<string, unknown>;
   mapping: MappingObservation;
   captureFamilyUpdatedAt: true;
+  expectedMappingAbsent: true;
+  queuePolicy: "none";
 }
 
 export interface UpdatePullChange {
@@ -108,6 +128,8 @@ export interface UpdatePullChange {
   mapping: MappingObservation;
   captureFamilyUpdatedAt: true;
   conflictWinner: "google" | "unchanged";
+  expected: PullChangeExpectation;
+  queuePolicy: "supersede_pending";
 }
 
 export interface KeepFamilyPullChange {
@@ -116,6 +138,8 @@ export interface KeepFamilyPullChange {
   familyEventId: string;
   mapping: MappingObservation;
   conflictWinner: "family";
+  expected: PullChangeExpectation;
+  queuePolicy: "ensure_update" | "supersede_pending";
 }
 
 export interface CancelPullChange {
@@ -123,7 +147,12 @@ export interface CancelPullChange {
   googleEventId: string;
   familyEventId: string;
   googleUpdatedAt: string | null;
+  mapping: MappingObservation;
+  captureFamilyUpdatedAt: true;
+  finalizeAfterPull: true;
   conflictWinner: "google" | "unchanged";
+  expected: PullChangeExpectation;
+  queuePolicy: "supersede_pending";
 }
 
 export interface CancellationConflictPullChange {
@@ -132,6 +161,8 @@ export interface CancellationConflictPullChange {
   familyEventId: string;
   mapping: MappingObservation;
   conflictWinner: "family";
+  expected: PullChangeExpectation;
+  queuePolicy: "supersede_pending";
 }
 
 export interface ReadOnlyPullChange {
@@ -139,12 +170,15 @@ export interface ReadOnlyPullChange {
   googleEventId: string;
   familyEventId: string;
   mapping: MappingObservation;
-  conflictWinner: "google" | "unchanged";
+  conflictWinner: "family" | "google" | "unchanged";
+  expected: PullChangeExpectation;
+  queuePolicy: "supersede_pending";
 }
 
 export interface IgnorePullChange {
   kind: "ignore";
   googleEventId: string;
+  queuePolicy: "none";
 }
 
 export type PullChange =
@@ -157,23 +191,64 @@ export type PullChange =
   | IgnorePullChange;
 
 export interface PullPageReconciliation {
-  scanId: string | null;
+  run: PullRunGuard;
+  scan: FullReconciliationScan | null;
   seenGoogleEventIds: string[];
+}
+
+export interface PullRunGuard {
+  expectedSyncToken: string | null;
+  expectedSyncVersion: string;
+}
+
+export interface FullReconciliationScan {
+  scanId: string;
+  generation: number;
+  startedAt: string;
 }
 
 export interface PullStore {
   loadMappedEvent(calendar: PullCalendar, googleEventId: string): Promise<MappedPullEvent | null>;
-  /** Apply the complete bounded page atomically; imports must upsert on the scoped Google event key. */
+  /**
+   * Apply one bounded page atomically. Every mapped change must CAS both expected
+   * row versions; imports must upsert on (connection, calendar, Google event ID).
+   * Queue changes, full-scan seen markers, captured baselines, and run-scoped
+   * cancellation-finalization guards are part of this same transaction.
+   */
   applyPage(
     calendar: PullCalendar,
     changes: PullChange[],
     reconciliation: PullPageReconciliation,
   ): Promise<void>;
-  saveSyncToken(calendar: PullCalendar, nextSyncToken: string): Promise<void>;
-  clearSyncToken(calendar: PullCalendar): Promise<void>;
-  beginFullReconciliation(calendar: PullCalendar): Promise<string>;
-  /** Atomically delete unseen mapped events and commit the new token only after the complete scan. */
-  finishFullReconciliation(calendar: PullCalendar, scanId: string, nextSyncToken: string): Promise<void>;
+  /**
+   * CAS the token/version and atomically finalize only cancellations confirmed
+   * by this pull whose post-page event and mapping versions still match. A
+   * concurrently changed pending cancellation must be retained and surfaced.
+   */
+  completeIncrementalPull(
+    calendar: PullCalendar,
+    run: PullRunGuard,
+    nextSyncToken: string,
+    pendingCancellationFamilyEventIds: string[],
+  ): Promise<void>;
+  /**
+   * Atomically CAS the calendar, acquire a generation-scoped scan lease, clear
+   * an expired token, and snapshot candidate mapping and Family-row versions.
+   */
+  beginFullReconciliation(calendar: PullCalendar, run: PullRunGuard): Promise<FullReconciliationScan>;
+  /**
+   * Delete only unseen candidates whose mapping and Family-row versions still
+   * match the scan-start snapshot, guarded-finalize cancellations, then commit
+   * the new token and release this exact scan generation atomically.
+   */
+  finishFullReconciliation(
+    calendar: PullCalendar,
+    scan: FullReconciliationScan,
+    nextSyncToken: string,
+    pendingCancellationFamilyEventIds: string[],
+  ): Promise<void>;
+  /** Best-effort generation-scoped lease cleanup after an incomplete full scan. */
+  abortFullReconciliation(calendar: PullCalendar, scan: FullReconciliationScan): Promise<void>;
   markReconnect(connectionId: string, ownerUserId: string): Promise<void>;
   recordFailure(calendar: PullCalendar, category: PullErrorCategory, safeMessage: string): Promise<void>;
 }
@@ -242,7 +317,11 @@ function categoryOf(error: unknown): PullErrorCategory {
     return category as PullErrorCategory;
   }
   const status = statusOf(error);
+  const reason = String((error as { reason?: unknown })?.reason || "");
   if (status === 401) return "authorization";
+  if (status === 403 && ["rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded"].includes(reason)) {
+    return "rate_limit";
+  }
   if (status === 403) return "permission";
   if (status === 429) return "rate_limit";
   if (status >= 500) return "transient";
@@ -256,6 +335,7 @@ function assertCalendarScope(calendar: PullCalendar): void {
   if (
     !calendar.id ||
     !calendar.google_calendar_id ||
+    !calendar.sync_version ||
     !calendar.enabled ||
     !calendar.ownerUserId ||
     !connection?.id ||
@@ -326,14 +406,42 @@ function familyEventPatch(translated: Record<string, unknown>): Record<string, u
   return googleOwnedFields;
 }
 
+function conflictWinner(mapped: MappedPullEvent, event: { updated?: string | null }): "family" | "google" | "unchanged" {
+  return chooseConflictWinner(
+    mapped.mapping,
+    { updated_at: mapped.syncRelevantFamilyUpdatedAt },
+    event,
+  );
+}
+
+function expectedVersions(mapped: MappedPullEvent): PullChangeExpectation {
+  return {
+    mappingUpdatedAt: mapped.mapping.updated_at,
+    familyUpdatedAt: mapped.familyEvent.updated_at,
+  };
+}
+
 function cancellationWinner(mapped: MappedPullEvent, event: GooglePullEvent): "family" | "google" | "unchanged" {
   if (typeof event.updated === "string" && !Number.isNaN(Date.parse(event.updated))) {
-    return chooseConflictWinner(mapped.mapping, mapped.familyEvent, event);
+    return conflictWinner(mapped, event);
   }
-  const localState = chooseConflictWinner(mapped.mapping, mapped.familyEvent, {
+  const localState = conflictWinner(mapped, {
     updated: mapped.mapping.last_google_updated_at,
   });
   return localState === "unchanged" ? "google" : "family";
+}
+
+function cancellationObservation(mapped: MappedPullEvent, event: GooglePullEvent): MappingObservation {
+  const updated = typeof event.updated === "string" && !Number.isNaN(Date.parse(event.updated))
+    ? event.updated
+    : mapped.mapping.last_google_updated_at;
+  return {
+    google_etag: typeof event.etag === "string" ? event.etag : mapped.mapping.google_etag,
+    google_updated_at: updated || mapped.mapping.google_updated_at,
+    ...(updated ? { last_google_updated_at: updated } : {}),
+    sync_state: "syncing",
+    safe_error_message: null,
+  };
 }
 
 function keepFamilyChange(
@@ -353,6 +461,8 @@ function keepFamilyChange(
     familyEventId: mapped.familyEvent.id,
     mapping: observation,
     conflictWinner: "family",
+    expected: expectedVersions(mapped),
+    queuePolicy: calendar.is_writable ? "ensure_update" : "supersede_pending",
   };
 }
 
@@ -368,7 +478,7 @@ async function changeForEvent(
   if (mapped) assertMappedScope(calendar, mapped, event.id);
 
   if (event.status === "cancelled") {
-    if (!mapped) return { kind: "ignore", googleEventId: event.id };
+    if (!mapped) return { kind: "ignore", googleEventId: event.id, queuePolicy: "none" };
     const conflictWinner = cancellationWinner(mapped, event);
     if (conflictWinner === "family") return {
       kind: "cancellation_conflict",
@@ -383,6 +493,8 @@ async function changeForEvent(
         safe_error_message: "Google deleted this event while Family Hub had newer changes",
       },
       conflictWinner: "family",
+      expected: expectedVersions(mapped),
+      queuePolicy: "supersede_pending",
     };
     return {
       kind: "cancel",
@@ -391,30 +503,33 @@ async function changeForEvent(
       googleUpdatedAt: typeof event.updated === "string" && !Number.isNaN(Date.parse(event.updated))
         ? event.updated
         : null,
+      mapping: cancellationObservation(mapped, event),
+      captureFamilyUpdatedAt: true,
+      finalizeAfterPull: true,
       conflictWinner,
+      expected: expectedVersions(mapped),
+      queuePolicy: "supersede_pending",
     };
   }
 
   const observation = requiredGoogleObservation(event);
-  const conflictWinner = mapped
-    ? chooseConflictWinner(mapped.mapping, mapped.familyEvent, event)
-    : null;
-  if (mapped && conflictWinner === "family") return keepFamilyChange(calendar, mapped, event);
-
   const translated = googleToFamilyEvent(event, {
     householdId: calendar.connection.household_id,
     defaultPersonId: calendar.connection.person_id,
     householdTimeZone: calendar.householdTimeZone,
   });
   if (!translated.supported) {
-    if (!mapped) return { kind: "ignore", googleEventId: event.id };
+    if (!mapped) return { kind: "ignore", googleEventId: event.id, queuePolicy: "none" };
+    const winner = conflictWinner(mapped, event);
     const safeMessage = READ_ONLY_MESSAGES[translated.readOnlyReason] || "Google event has unsupported content";
     return {
       kind: "read_only",
       googleEventId: event.id,
       familyEventId: mapped.familyEvent.id,
       mapping: mappingObservation(event, "read_only", safeMessage),
-      conflictWinner: conflictWinner as "google" | "unchanged",
+      conflictWinner: winner,
+      expected: expectedVersions(mapped),
+      queuePolicy: "supersede_pending",
     };
   }
 
@@ -431,8 +546,13 @@ async function changeForEvent(
         safe_error_message: calendar.is_writable ? null : "Google calendar is read-only",
       },
       captureFamilyUpdatedAt: true,
+      expectedMappingAbsent: true,
+      queuePolicy: "none",
     };
   }
+
+  const winner = conflictWinner(mapped, event);
+  if (winner === "family") return keepFamilyChange(calendar, mapped, event);
 
   return {
     kind: "update",
@@ -441,7 +561,9 @@ async function changeForEvent(
     familyEventPatch: familyEventPatch(translated.event as Record<string, unknown>),
     mapping: synchronizedObservation(calendar, event),
     captureFamilyUpdatedAt: true,
-    conflictWinner: conflictWinner as "google" | "unchanged",
+    conflictWinner: winner,
+    expected: expectedVersions(mapped),
+    queuePolicy: "supersede_pending",
   };
 }
 
@@ -462,54 +584,76 @@ async function runPull(
   calendar: PullCalendar,
   dependencies: PullDependencies,
   mode: "incremental" | "full",
+  run: PullRunGuard,
 ): Promise<PullResult> {
-  const scanId = mode === "full" ? await dependencies.store.beginFullReconciliation(calendar) : null;
+  let scan: FullReconciliationScan | null = null;
+  let completed = false;
   const visitedPageTokens = new Set<string>();
+  const pendingCancellationFamilyEventIds = new Set<string>();
   let pageToken: string | undefined;
   let pages = 0;
   let processed = 0;
 
-  while (true) {
-    const request: PullPageRequest = {
-      singleEvents: false,
-      showDeleted: true,
-      ...(mode === "incremental" ? { syncToken: calendar.sync_token as string } : {}),
-      ...(pageToken ? { pageToken } : {}),
-    };
-    const page = validatedPage(await dependencies.google.list(
-      calendar.connection,
-      calendar,
-      calendar.google_calendar_id,
-      request,
-    ));
-    const changes: PullChange[] = [];
-    for (const event of page.items) changes.push(await changeForEvent(calendar, dependencies, event));
-    await dependencies.store.applyPage(calendar, changes, {
-      scanId,
-      seenGoogleEventIds: page.items.map(({ id }) => id),
-    });
-    pages += 1;
-    processed += page.items.length;
+  try {
+    if (mode === "full") scan = await dependencies.store.beginFullReconciliation(calendar, run);
+    while (true) {
+      const request: PullPageRequest = {
+        singleEvents: false,
+        showDeleted: true,
+        ...(mode === "incremental" ? { syncToken: run.expectedSyncToken as string } : {}),
+        ...(pageToken ? { pageToken } : {}),
+      };
+      const page = validatedPage(await dependencies.google.list(
+        calendar.connection,
+        calendar,
+        calendar.google_calendar_id,
+        request,
+      ));
+      const changes: PullChange[] = [];
+      for (const event of page.items) changes.push(await changeForEvent(calendar, dependencies, event));
+      for (const change of changes) {
+        if (change.kind === "cancel" && change.finalizeAfterPull) {
+          pendingCancellationFamilyEventIds.add(change.familyEventId);
+        }
+      }
+      await dependencies.store.applyPage(calendar, changes, {
+        run,
+        scan,
+        seenGoogleEventIds: page.items.map(({ id }) => id),
+      });
+      pages += 1;
+      processed += page.items.length;
 
-    if (page.nextPageToken) {
-      if (visitedPageTokens.has(page.nextPageToken)) throw new GooglePullError("validation", 502);
-      visitedPageTokens.add(page.nextPageToken);
-      pageToken = page.nextPageToken;
-      continue;
+      if (page.nextPageToken) {
+        if (visitedPageTokens.has(page.nextPageToken)) throw new GooglePullError("validation", 502);
+        visitedPageTokens.add(page.nextPageToken);
+        pageToken = page.nextPageToken;
+        continue;
+      }
+      if (!page.nextSyncToken) throw new GooglePullError("validation", 502);
+      const cancellations = [...pendingCancellationFamilyEventIds];
+      if (mode === "full") {
+        await dependencies.store.finishFullReconciliation(calendar, scan as FullReconciliationScan, page.nextSyncToken, cancellations);
+      } else {
+        await dependencies.store.completeIncrementalPull(calendar, run, page.nextSyncToken, cancellations);
+      }
+      completed = true;
+      return {
+        status: "complete",
+        mode,
+        pages,
+        processed,
+        nextSyncToken: page.nextSyncToken,
+      };
     }
-    if (!page.nextSyncToken) throw new GooglePullError("validation", 502);
-    if (mode === "full") {
-      await dependencies.store.finishFullReconciliation(calendar, scanId as string, page.nextSyncToken);
-    } else {
-      await dependencies.store.saveSyncToken(calendar, page.nextSyncToken);
+  } finally {
+    if (scan && !completed) {
+      try {
+        await dependencies.store.abortFullReconciliation(calendar, scan);
+      } catch {
+        // Never replace the sanitized pull failure with lease-cleanup details.
+      }
     }
-    return {
-      status: "complete",
-      mode,
-      pages,
-      processed,
-      nextSyncToken: page.nextSyncToken,
-    };
   }
 }
 
@@ -533,14 +677,17 @@ export async function pullCalendar(
   dependencies: PullDependencies,
 ): Promise<PullResult> {
   assertCalendarScope(calendar);
+  const run: PullRunGuard = {
+    expectedSyncToken: calendar.sync_token,
+    expectedSyncVersion: calendar.sync_version,
+  };
   try {
-    if (!calendar.sync_token) return await runPull(calendar, dependencies, "full");
+    if (!calendar.sync_token) return await runPull(calendar, dependencies, "full", run);
     try {
-      return await runPull(calendar, dependencies, "incremental");
+      return await runPull(calendar, dependencies, "incremental", run);
     } catch (error) {
       if (statusOf(error) !== 410) throw error;
-      await dependencies.store.clearSyncToken(calendar);
-      return await runPull({ ...calendar, sync_token: null }, dependencies, "full");
+      return await runPull(calendar, dependencies, "full", run);
     }
   } catch (error) {
     const category = categoryOf(error);
