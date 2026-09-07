@@ -8,8 +8,9 @@ const baseUrl = new URL("../supabase/migrations/202608260001_google_sync_schema.
 test("mapped event direct updates are restricted to the owning adult's person reassignment", async () => {
   const sql = await readFile(guardUrl, "utf8");
   assert.match(sql, /before update on public\.events/i);
-  assert.match(sql, /auth\.role\(\)[\s\S]*service_role/i);
-  assert.match(sql, /current_setting\('app\.skip_google_event_queue',\s*true\)/i);
+  assert.match(sql, /security invoker/i);
+  assert.doesNotMatch(sql, /current_setting|set_config/i);
+  assert.match(sql, /current_user\s*<>\s*'authenticated'/i);
   assert.match(sql, /v_owner_user_id\s*<>\s*auth\.uid\(\)/i);
   assert.match(sql, /new\.person_id is distinct from old\.person_id/i);
   for (const protectedColumn of ["id", "household_id", "created_by", "title", "event_date", "start_time", "end_time", "all_day", "recurrence", "recurrence_end", "sync_deleted_at", "updated_at"]) {
@@ -18,13 +19,33 @@ test("mapped event direct updates are restricted to the owning adult's person re
   assert.match(sql, /p\.household_id\s*=\s*old\.household_id/i);
 });
 
-test("trusted delete-everywhere RPC marks its internal event update for the guard bypass", async () => {
+test("trusted delete-everywhere RPC needs no custom transaction setting", async () => {
   const sql = await readFile(baseUrl, "utf8");
   const requestDelete = sql.match(/create or replace function public\.request_google_event_delete[\s\S]*?\nend;\n\$\$;/i)?.[0] ?? "";
-  assert.match(requestDelete, /set_config\('app\.skip_google_event_queue',\s*'on',\s*true\)[\s\S]*update public\.events[\s\S]*sync_deleted_at/i);
+  assert.doesNotMatch(requestDelete, /set_config|current_setting/i);
+  assert.match(requestDelete, /update public\.events[\s\S]*sync_deleted_at/i);
+});
+
+test("no migration uses a user-spoofable setting to suppress authorization or queue work", async () => {
+  const migrationNames = [
+    "202608260001_google_sync_schema.sql",
+    "202608260002_google_sync_schedule.sql",
+    "202608270004_google_event_update_guard.sql",
+  ];
+  const sql = (await Promise.all(migrationNames.map((name) => readFile(new URL(`../supabase/migrations/${name}`, import.meta.url), "utf8")))).join("\n");
+  assert.doesNotMatch(sql, /app\.skip_google_event_queue|set_config\s*\(/i);
+});
+
+test("spoofing the removed GUC cannot authorize a direct mapped-event update", () => {
+  const authorize = ({ effectiveRole, ownsMapping, protectedChange, personInHousehold }) =>
+    effectiveRole !== "authenticated" || (ownsMapping && !protectedChange && personInHousehold);
+  const spoofedSettings = { "app.skip_google_event_queue": "on" };
+  assert.equal(authorize({ effectiveRole: "authenticated", ownsMapping: false, protectedChange: false, personInHousehold: true, spoofedSettings }), false);
+  assert.equal(authorize({ effectiveRole: "authenticated", ownsMapping: true, protectedChange: true, personInHousehold: true, spoofedSettings }), false);
+  assert.equal(authorize({ effectiveRole: "authenticated", ownsMapping: true, protectedChange: false, personInHousehold: true, spoofedSettings }), true);
 });
 
 test("Family-only event updates bypass the mapped-event restriction", async () => {
   const sql = await readFile(guardUrl, "utf8");
-  assert.match(sql, /if not found then\s+return new;/i);
+  assert.match(sql, /if v_owner_user_id is null then\s+return new;/i);
 });

@@ -124,7 +124,6 @@ begin
     and status = 'processing' and lease_expires_at > clock_timestamp() for update;
   if not found then raise exception 'Google sync job is not currently leased'; end if;
   select * into v_mapping from public.google_event_mappings where id = v_job.google_event_mapping_id for update;
-  perform set_config('app.skip_google_event_queue', 'on', true);
   if coalesce((p_completion->>'finalizeLocalDelete')::boolean, false) then
     delete from public.google_event_mappings where id = v_mapping.id;
     delete from public.events where id = v_job.family_event_id;
@@ -225,7 +224,6 @@ begin
     select * into v_event from public.events where id=v_mapping.family_event_id for update;
     if not found or v_event.updated_at is distinct from (v_change#>>'{expected,familyUpdatedAt}')::timestamptz
       then raise exception 'Stale Family event'; end if;
-    perform set_config('app.skip_google_event_queue','on',true);
     if v_change->>'kind' in ('update','cancel') then
       update public.events e set title=coalesce(v_change#>>'{familyEventPatch,title}',e.title),
         event_date=coalesce((v_change#>>'{familyEventPatch,event_date}')::date,e.event_date),

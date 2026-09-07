@@ -1,27 +1,44 @@
 -- Direct browser updates may only reassign the person on a mapped event owned
 -- by that adult. Google-owned changes continue through the atomic RPC, while
--- service-role worker updates and flagged RPC internals retain their paths.
+-- service-role workers and SECURITY DEFINER RPC statements retain their paths.
+create or replace function public.google_mapped_event_owner(p_family_event_id uuid)
+returns uuid
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select c.user_id
+  from public.google_event_mappings m
+  join public.google_connections c on c.id = m.google_connection_id
+  join public.events e on e.id = m.family_event_id
+  where m.family_event_id = p_family_event_id
+    and public.is_household_member(e.household_id);
+$$;
+
+revoke all on function public.google_mapped_event_owner(uuid) from public, anon, authenticated, service_role;
+grant execute on function public.google_mapped_event_owner(uuid) to authenticated;
+
 create or replace function public.guard_direct_mapped_event_update()
 returns trigger
 language plpgsql
-security definer
+security invoker
 set search_path = public
 as $$
 declare
   v_owner_user_id uuid;
 begin
-  if coalesce(auth.role(), '') = 'service_role'
-    or current_setting('app.skip_google_event_queue', true) = 'on' then
+  -- A direct PostgREST update executes as `authenticated`. Statements inside
+  -- our narrow SECURITY DEFINER RPCs execute as their owning database role,
+  -- and service workers execute as `service_role`; neither relies on GUC state.
+  if current_user <> 'authenticated' then
     return new;
   end if;
 
-  select c.user_id into v_owner_user_id
-  from public.google_event_mappings m
-  join public.google_connections c on c.id = m.google_connection_id
-  where m.family_event_id = old.id;
+  v_owner_user_id := public.google_mapped_event_owner(old.id);
 
   -- Family-Hub-only events preserve their existing direct update path.
-  if not found then
+  if v_owner_user_id is null then
     return new;
   end if;
 

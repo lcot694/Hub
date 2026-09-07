@@ -438,12 +438,6 @@ begin
     return new;
   end if;
 
-  -- save_google_backed_event locks and enqueues explicitly so an edit cannot
-  -- race its mapping validation with this general-purpose trigger.
-  if current_setting('app.skip_google_event_queue', true) = 'on' then
-    return new;
-  end if;
-
   if tg_op = 'INSERT' then
     perform public.assert_google_event_change_allowed(new.id);
     perform public.enqueue_google_event_change_internal(new.id, 'create');
@@ -651,7 +645,6 @@ begin
     or v_existing_event.recurrence is distinct from v_recurrence
     or v_existing_event.recurrence_end is distinct from v_recurrence_end;
 
-  perform set_config('app.skip_google_event_queue', 'on', true);
   update public.events
   set person_id = v_person_id,
       title = v_title,
@@ -757,7 +750,6 @@ begin
     return;
   end if;
 
-  perform set_config('app.skip_google_event_queue', 'on', true);
   update public.events
   set sync_deleted_at = clock_timestamp()
   where id = p_family_event_id
