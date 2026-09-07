@@ -2,7 +2,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { toISO, parseISO, occursOn, eventsFor } from "./lib/calendar-domain.js";
 import {
   FAMILY_HUB_ONLY, createGoogleSettings, editPermissions, eventWritePlan,
-  googleDeleteWarning, syncPresentation, visibleEvents,
+  googleDeleteWarning, syncPresentation, visibleEvents, buildEventSyncIndex, createOperationGuard,
 } from "./lib/google-ui.js";
 
 const cfg = window.FAMILY_HUB_CONFIG || {};
@@ -28,7 +28,7 @@ let realtimeChannel = null;
 let editingEventId = null;
 let googleStatusByEvent = new Map();
 let loadGeneration = 0;
-let dialogGeneration = 0;
+const eventDialogGuard=createOperationGuard();
 
 function showScreen(name){
   Object.values(ui).forEach(x=>x.classList.add("hidden"));
@@ -72,23 +72,31 @@ async function loadHousehold(){
 async function loadData(){
   const generation=++loadGeneration;
   setSync("Syncing…",false);
-  const [{data:p,error:pe},{data:e,error:ee},{data:s,error:se}] = await Promise.all([
+  const [{data:p,error:pe},{data:e,error:ee}] = await Promise.all([
     supabase.from("people").select("*").eq("household_id",household.id).order("sort_order"),
-    supabase.from("events").select("*").eq("household_id",household.id).order("event_date"),
-    supabase.rpc("get_google_sync_status")
+    supabase.from("events").select("*").eq("household_id",household.id).order("event_date")
   ]);
   if(generation!==loadGeneration)return;
-  if(pe||ee||se){console.error(pe||ee||se);setSync("Sync error",false);return}
+  if(pe||ee){console.error(pe||ee);setSync("Sync error",false);return}
   people=p||[];rawEvents=visibleEvents(e||[]);
-  googleStatusByEvent=new Map((s||[]).filter(x=>x.family_event_id).map(x=>[x.family_event_id,x]));
+  googleStatusByEvent=buildEventSyncIndex(rawEvents,null,new Error("pending"),currentUser.id).byEvent;
   setSync("Connected",true);
+  loadGoogleStatuses(generation);
+}
+async function loadGoogleStatuses(generation){
+  let data=null,error=null;
+  try{({data,error}=await supabase.rpc("get_google_sync_status",{p_household_id:household.id}))}catch(cause){error=cause}
+  if(generation!==loadGeneration)return;
+  googleStatusByEvent=buildEventSyncIndex(rawEvents,data,error,currentUser.id).byEvent;
+  if(error){console.warn("Google sync status unavailable");setSync("Calendar available · Google status unavailable",false)}
+  render();
 }
 function subscribeRealtime(){
   if(realtimeChannel) supabase.removeChannel(realtimeChannel);
   realtimeChannel=supabase.channel(`household-${household.id}`)
     .on("postgres_changes",{event:"*",schema:"public",table:"events",filter:`household_id=eq.${household.id}`}, async()=>{await loadData();render()})
     .on("postgres_changes",{event:"*",schema:"public",table:"people",filter:`household_id=eq.${household.id}`}, async()=>{await loadData();render()})
-    .on("postgres_changes",{event:"*",schema:"public",table:"google_event_mappings"}, async()=>{await loadData();render()})
+    .on("postgres_changes",{event:"*",schema:"public",table:"google_event_sync_status",filter:`household_id=eq.${household.id}`}, async()=>{await loadData();render()})
     .subscribe();
 }
 function setSync(text,ok=true){if(!$("syncText"))return;$("syncText").textContent=text;$("syncDot").style.background=ok?"#4f9d69":"#c6923c"}
@@ -273,21 +281,22 @@ function ensureEditButton(){
       if(!confirm(warning))return;
 
       setSync("Deleting…",false);
-      btn.disabled=true;
-      const eventId=editingEventId,generation=dialogGeneration;
-      const {error}=mapping
-        ? await supabase.rpc("request_google_event_delete",{p_family_event_id:eventId})
-        : await supabase.from("events").delete().eq("id",eventId);
-      if(generation===dialogGeneration)btn.disabled=false;
+      const eventId=editingEventId,operation=eventDialogGuard.begin(btn);
+      let error,operationCurrent=false;
+      try{
+        ({error}=mapping
+          ? await supabase.rpc("request_google_event_delete",{p_family_event_id:eventId})
+          : await supabase.from("events").delete().eq("id",eventId));
+      }finally{operationCurrent=eventDialogGuard.finish(operation)}
 
       if(error){
-        if(generation!==dialogGeneration)return;
+        if(!operationCurrent)return;
         alert(error.message);
         setSync("Delete error",false);
         return;
       }
 
-      if(generation===dialogGeneration&&editingEventId===eventId){editingEventId=null;$("eventDialog").close()}
+      if(operationCurrent&&editingEventId===eventId){editingEventId=null;$("eventDialog").close();eventDialogGuard.invalidate()}
     };
 
     actions.prepend(btn);
@@ -324,7 +333,7 @@ function setGoogleFieldPermissions(mapping){
   ["eventCalendar","eventAllDay","eventDate"].forEach(id=>{$(id).disabled=!permissions.date});
   ["eventTime","eventEndTime"].forEach(id=>{$(id).disabled=!permissions.times});
   ["eventRepeat","eventRepeatEnd"].forEach(id=>{$(id).disabled=!permissions.recurrence});
-  $("eventPerson").disabled=false;
+  $("eventPerson").disabled=!permissions.person;
   $("deleteEventBtn").disabled=!permissions.deleteEverywhere;
   $("deleteEventBtn").title=permissions.deleteEverywhere?"":"Read-only Google events cannot be deleted from Family Hub";
 }
@@ -335,7 +344,7 @@ function renderDialogSyncStatus(mapping){
 }
 
 function openAdd(d=new Date()){
-  dialogGeneration++;
+  eventDialogGuard.invalidate();
   editingEventId=null;
   setEventDialogMode("add");
 
@@ -357,7 +366,7 @@ function openAdd(d=new Date()){
 }
 
 function openEdit(e){
-  dialogGeneration++;
+  eventDialogGuard.invalidate();
   editingEventId=e.id;
   setEventDialogMode("edit");
 
@@ -381,7 +390,7 @@ function openEdit(e){
 
   $("eventDialog").showModal();
 }
-document.querySelectorAll("[data-close]").forEach(b=>b.onclick=()=>{if(b.dataset.close==="eventDialog")dialogGeneration++;$(b.dataset.close).close()});
+document.querySelectorAll("[data-close]").forEach(b=>b.onclick=()=>{if(b.dataset.close==="eventDialog")eventDialogGuard.invalidate();$(b.dataset.close).close()});
 document.querySelectorAll(".view-switch button").forEach(b=>b.onclick=()=>{view=b.dataset.view;render()});
 $("todayBtn").onclick=()=>{cursor=new Date();render()};
 $("prevBtn").onclick=()=>{cursor=view==="month"?new Date(cursor.getFullYear(),cursor.getMonth()-1,1):addDays(cursor,view==="week"?-7:-1);render()};
@@ -395,17 +404,16 @@ $("eventAllDay").onchange=setAllDayControls;
 $("eventForm").onsubmit=async e=>{
   e.preventDefault();
   const saveButton=$("eventForm").querySelector('button[type="submit"]');
-  const eventId=editingEventId,generation=dialogGeneration;
+  const eventId=editingEventId;
   const mapping=eventId?googleStatusByEvent.get(eventId):null;
   setSync(editingEventId ? "Updating…" : "Saving…",false);
 
   if(mapping&&!editPermissions(mapping).title){
-    saveButton.disabled=true;
-    const result=await supabase.from("events").update({person_id:$("eventPerson").value||null}).eq("id",eventId);
-    if(generation!==dialogGeneration)return;
-    saveButton.disabled=false;
+    const operation=eventDialogGuard.begin(saveButton);
+    let result,operationCurrent=false;try{result=await supabase.from("events").update({person_id:$("eventPerson").value||null}).eq("id",eventId)}finally{operationCurrent=eventDialogGuard.finish(operation)}
+    if(!operationCurrent)return;
     if(result.error){alert(result.error.message);setSync("Update error",false);return}
-    if(generation===dialogGeneration&&editingEventId===eventId){editingEventId=null;$("eventDialog").close()}
+    if(editingEventId===eventId){editingEventId=null;$("eventDialog").close();eventDialogGuard.invalidate()}
     return;
   }
 
@@ -426,16 +434,17 @@ $("eventForm").onsubmit=async e=>{
   };
 
   const plan=eventWritePlan(payload,$("eventCalendar").value,eventId!==null);
-  saveButton.disabled=true;
-  let result;
-  if(plan.kind==="google-rpc")result=await supabase.rpc(plan.functionName,plan.args);
-  else if(plan.kind==="family-update"){
-    const {id:_eventId,...familyPayload}=plan.payload;
-    result=await supabase.from("events").update(familyPayload).eq("id",eventId);
-  }
-  else result=await supabase.from("events").insert({...plan.payload,created_by:currentUser.id});
-  if(generation!==dialogGeneration)return;
-  saveButton.disabled=false;
+  const operation=eventDialogGuard.begin(saveButton);
+  let result,operationCurrent=false;
+  try{
+    if(plan.kind==="google-rpc")result=await supabase.rpc(plan.functionName,plan.args);
+    else if(plan.kind==="family-update"){
+      const {id:_eventId,...familyPayload}=plan.payload;
+      result=await supabase.from("events").update(familyPayload).eq("id",eventId);
+    }
+    else result=await supabase.from("events").insert({...plan.payload,created_by:currentUser.id});
+  }finally{operationCurrent=eventDialogGuard.finish(operation)}
+  if(!operationCurrent)return;
 
   if(result.error){
     alert(result.error.message);
@@ -443,7 +452,7 @@ $("eventForm").onsubmit=async e=>{
     return;
   }
 
-  if(generation===dialogGeneration&&editingEventId===eventId){editingEventId=null;$("eventDialog").close()}
+  if(editingEventId===eventId){editingEventId=null;$("eventDialog").close();eventDialogGuard.invalidate()}
 };
 $("quickForm").onsubmit=async e=>{
   e.preventDefault();const {error}=await supabase.from("events").insert({household_id:household.id,person_id:$("quickPerson").value||null,title:$("quickTitle").value.trim(),event_date:$("quickDate").value,start_time:$("quickTime").value||null,recurrence:"none",created_by:currentUser.id});
