@@ -239,7 +239,9 @@ begin
     end if;
     update public.google_event_mappings m set google_etag=v_change#>>'{mapping,google_etag}',
       google_updated_at=(v_change#>>'{mapping,google_updated_at}')::timestamptz,
-      last_google_updated_at=(v_change#>>'{mapping,last_google_updated_at}')::timestamptz,
+      last_google_updated_at=case when v_change#>'{mapping}' ? 'last_google_updated_at'
+        then (v_change#>>'{mapping,last_google_updated_at}')::timestamptz
+        else m.last_google_updated_at end,
       last_family_updated_at=v_event.updated_at,sync_state=v_change#>>'{mapping,sync_state}',
       safe_error_message=v_change#>>'{mapping,safe_error_message}',updated_at=clock_timestamp()
     where m.id=v_mapping.id and m.updated_at=v_mapping.updated_at returning * into v_mapping;
@@ -330,7 +332,9 @@ begin
       and e.id in (select value::uuid from jsonb_array_elements_text(p_cancellations))
       and m.updated_at=g.mapping_updated_at and e.updated_at=g.family_updated_at and e.sync_deleted_at is not null;
   delete from public.events e using public.google_pull_cancellation_guards g where g.google_calendar_id=p_calendar_id
-    and g.family_event_id=e.id and e.updated_at=g.family_updated_at and e.sync_deleted_at is not null
+    and g.family_event_id=e.id
+    and e.id in (select value::uuid from jsonb_array_elements_text(p_cancellations))
+    and e.updated_at=g.family_updated_at and e.sync_deleted_at is not null
     and not exists(select 1 from public.google_event_mappings m where m.family_event_id=e.id);
   update public.google_calendars set sync_token=p_next_sync_token,last_synced_at=clock_timestamp(),sync_claimed_until=null,updated_at=clock_timestamp()
     where id=p_calendar_id and sync_token is null and updated_at=v_scan.expected_sync_version;

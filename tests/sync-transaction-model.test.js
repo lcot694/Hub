@@ -23,8 +23,16 @@ test("cancellation and reconciliation guards preserve concurrent changes", () =>
   const scan = model.beginFull("v1");
   model.cancel("gone", "e1");
   model.concurrentEdit("changed");
-  model.finishFull(scan, { seen: [], nextVersion: "v2" });
+  model.finishFull(scan, { seen: [], cancellations: ["gone"], nextVersion: "v2" });
   assert.deepEqual(Object.keys(model.snapshot().mappings), ["changed"]);
   assert.equal(model.snapshot().version, "v2");
   assert.throws(() => model.abortFull(scan), /stale/);
+});
+
+test("full completion retains a cancellation guard not named by this pull", () => {
+  const model = createSyncTransactionModel({ version: "v1", mappings: { retained: { eventVersion: "e1" } } });
+  const scan = model.beginFull("v1");
+  model.cancel("retained", "e1");
+  model.finishFull(scan, { seen: ["retained"], cancellations: [], nextVersion: "v2" });
+  assert.deepEqual(model.snapshot().guards, { retained: "e1" });
 });

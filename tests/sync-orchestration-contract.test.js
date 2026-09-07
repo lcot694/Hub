@@ -174,3 +174,10 @@ test("schedule uses current household membership, five-minute cron, and Vault re
     "enqueue_google_event_change_internal", "pg_advisory_xact_lock", "candidate_versions",
   ]) assert.match(sql, new RegExp(token));
 });
+
+test("pull SQL preserves omitted Google baselines and scopes full cancellations to the run list", async () => {
+  const sql = await readFile(new URL("../supabase/migrations/202608260002_google_sync_schedule.sql", import.meta.url), "utf8");
+  assert.match(sql, /v_change#>'\{mapping\}'\s*\?\s*'last_google_updated_at'/);
+  const finish = sql.slice(sql.indexOf("create or replace function public.finish_google_full_reconciliation"), sql.indexOf("create or replace function public.abort_google_full_reconciliation"));
+  assert.match(finish, /e\.id\s+in\s*\(select value::uuid from jsonb_array_elements_text\(p_cancellations\)\)/);
+});

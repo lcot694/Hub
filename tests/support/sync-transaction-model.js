@@ -3,12 +3,13 @@ export function createSyncTransactionModel(initial = {}) {
     version: initial.version,
     mappings: structuredClone(initial.mappings || {}),
     events: structuredClone(initial.events || []),
-    queue: [], seen: [], generation: 0, scan: null,
+    queue: [], seen: [], guards: {}, generation: 0, scan: null,
   };
   const snapshot = () => {
     const copy = structuredClone(state);
     delete copy.generation; delete copy.scan;
     if (!copy.events.length) delete copy.events;
+    if (!Object.keys(copy.guards).length) delete copy.guards;
     return copy;
   };
   return {
@@ -41,9 +42,10 @@ export function createSyncTransactionModel(initial = {}) {
     cancel(id, expected) {
       if (state.mappings[id]?.eventVersion !== expected) throw new Error("stale cancellation");
       state.mappings[id].cancelGuard = expected;
+      state.guards[id] = expected;
     },
     concurrentEdit(id) { state.mappings[id].eventVersion = "concurrent"; },
-    finishFull(scan, { seen, nextVersion }) {
+    finishFull(scan, { seen, cancellations = [], nextVersion }) {
       if (!state.scan || scan.generation !== state.scan.generation || scan.version !== state.version) throw new Error("stale scan");
       for (const [id, candidate] of Object.entries(scan.candidates)) {
         const current = state.mappings[id];
@@ -51,6 +53,7 @@ export function createSyncTransactionModel(initial = {}) {
           delete state.mappings[id]; state.events = state.events.filter(value => value !== `event:${id}`);
         }
       }
+      for (const id of cancellations) delete state.guards[id];
       state.version = nextVersion; state.scan = null;
     },
     abortFull(scan) {
