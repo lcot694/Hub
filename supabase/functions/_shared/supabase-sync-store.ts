@@ -1,0 +1,115 @@
+import type { SupabaseClient } from "npm:@supabase/supabase-js@2";
+import {
+  createGooglePullAdapter,
+  type FullReconciliationScan,
+  type MappedPullEvent,
+  type PullCalendar,
+  type PullChange,
+  type PullDependencies,
+  type PullErrorCategory,
+  type PullPageReconciliation,
+  type PullRunGuard,
+  type PullStore,
+} from "./pull-worker.ts";
+import {
+  createGooglePushAdapter,
+  type ClaimedPushJob,
+  type PushCompletion,
+  type PushContext,
+  type PushDependencies,
+  type PushErrorCategory,
+  type PushStore,
+} from "./push-worker.ts";
+import type { GoogleClientDependencies } from "./google-client.ts";
+
+type RpcClient = Pick<SupabaseClient, "rpc">;
+
+async function rpc<T>(database: RpcClient, name: string, parameters: Record<string, unknown>): Promise<T> {
+  const { data, error } = await database.rpc(name, parameters);
+  if (error) throw new Error("Google synchronization database operation failed");
+  return data as T;
+}
+
+export function createSupabasePushStore(database: RpcClient): PushStore {
+  return {
+    loadContext: (job: ClaimedPushJob) => rpc<PushContext>(database, "load_google_push_context", {
+      p_job_id: job.id,
+      p_claim_token: job.claim_token,
+    }),
+    complete: (jobId: string, claimToken: string, completion: PushCompletion) => rpc<void>(
+      database,
+      "complete_google_push_job",
+      { p_job_id: jobId, p_claim_token: claimToken, p_completion: completion },
+    ),
+    fail: (jobId: string, claimToken: string, category: PushErrorCategory, safeMessage: string, nextAttemptAt: string | null) => rpc<void>(
+      database,
+      "fail_google_sync_job",
+      {
+        p_job_id: jobId,
+        p_claim_token: claimToken,
+        p_error_category: category,
+        p_safe_error_message: safeMessage,
+        p_next_attempt_at: nextAttemptAt,
+      },
+    ),
+    markReconnect: (connectionId: string, ownerUserId: string) => rpc<void>(database, "mark_google_connection_reconnect", {
+      p_connection_id: connectionId,
+      p_user_id: ownerUserId,
+    }),
+  };
+}
+
+export function createSupabasePullStore(database: RpcClient): PullStore {
+  return {
+    loadMappedEvent: (calendar: PullCalendar, googleEventId: string) => rpc<MappedPullEvent | null>(
+      database,
+      "load_google_pull_mapping",
+      { p_calendar_id: calendar.id, p_google_event_id: googleEventId },
+    ),
+    applyPage: (calendar: PullCalendar, changes: PullChange[], reconciliation: PullPageReconciliation) => rpc<void>(
+      database,
+      "apply_google_pull_page",
+      { p_calendar_id: calendar.id, p_changes: changes, p_reconciliation: reconciliation },
+    ),
+    completeIncrementalPull: (calendar: PullCalendar, run: PullRunGuard, nextSyncToken: string, cancellations: string[]) => rpc<void>(
+      database,
+      "complete_google_incremental_pull",
+      { p_calendar_id: calendar.id, p_run: run, p_next_sync_token: nextSyncToken, p_cancellations: cancellations },
+    ),
+    beginFullReconciliation: (calendar: PullCalendar, run: PullRunGuard) => rpc<FullReconciliationScan>(
+      database,
+      "begin_google_full_reconciliation",
+      { p_calendar_id: calendar.id, p_run: run },
+    ),
+    finishFullReconciliation: (calendar: PullCalendar, scan: FullReconciliationScan, nextSyncToken: string, cancellations: string[]) => rpc<void>(
+      database,
+      "finish_google_full_reconciliation",
+      { p_calendar_id: calendar.id, p_scan: scan, p_next_sync_token: nextSyncToken, p_cancellations: cancellations },
+    ),
+    abortFullReconciliation: (calendar: PullCalendar, scan: FullReconciliationScan) => rpc<void>(
+      database,
+      "abort_google_full_reconciliation",
+      { p_calendar_id: calendar.id, p_scan: scan },
+    ),
+    markReconnect: (connectionId: string, ownerUserId: string) => rpc<void>(database, "mark_google_connection_reconnect", {
+      p_connection_id: connectionId,
+      p_user_id: ownerUserId,
+    }),
+    recordFailure: (calendar: PullCalendar, category: PullErrorCategory, safeMessage: string) => rpc<void>(
+      database,
+      "record_google_pull_failure",
+      { p_calendar_id: calendar.id, p_error_category: category, p_safe_error_message: safeMessage },
+    ),
+  };
+}
+
+export function createSupabaseWorkerDependencies(
+  database: SupabaseClient,
+  googleClient: GoogleClientDependencies = {},
+): { pullDependencies: PullDependencies; pushDependencies: PushDependencies } {
+  const client = { ...googleClient, database };
+  return {
+    pullDependencies: { store: createSupabasePullStore(database), google: createGooglePullAdapter(client) },
+    pushDependencies: { store: createSupabasePushStore(database), google: createGooglePushAdapter(client) },
+  };
+}

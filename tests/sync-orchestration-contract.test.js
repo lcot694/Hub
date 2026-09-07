@@ -88,6 +88,35 @@ test("scheduled sync pulls and drains bounded batches including recovered leases
   assert.deepEqual(jobs, ["pending", "expired-lease"]);
 });
 
+test("scheduled sync isolates pull and push failures so later work still runs", async () => {
+  const { createScheduledSyncHandler } = await scheduledApi;
+  const pulled = [], pushed = [];
+  const response = await createScheduledSyncHandler({
+    env: () => "cron-secret",
+    store: {
+      listDueCalendars: async () => [{ id: "pull-fails" }, { id: "pull-runs" }],
+      claimJobs: async () => [{ id: "push-fails" }, { id: "push-runs" }],
+    },
+    pull: async ({ id }) => { pulled.push(id); if (id === "pull-fails") throw new Error("private pull detail"); },
+    push: async ({ id }) => { pushed.push(id); if (id === "push-fails") throw new Error("private push detail"); },
+  })(new Request("https://project.test/google-sync-scheduled", { method: "POST", headers: { Authorization: "Bearer cron-secret" } }));
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(pulled, ["pull-fails", "pull-runs"]);
+  assert.deepEqual(pushed, ["push-fails", "push-runs"]);
+  assert.deepEqual(await response.json(), { calendarsProcessed: 2, jobsProcessed: 2, failures: 2, workRemaining: false });
+});
+
+test("production database composition supplies both worker stores and Google adapters", async () => {
+  const { createScheduledDatabaseStore } = await scheduledApi;
+  const database = { rpc: async () => ({ data: [], error: null }), from() { throw new Error("query should be lazy"); } };
+  const store = createScheduledDatabaseStore(database, { fetch: async () => new Response(null, { status: 204 }) });
+  assert.equal(typeof store.pullDependencies?.store.loadMappedEvent, "function");
+  assert.equal(typeof store.pullDependencies?.google.list, "function");
+  assert.equal(typeof store.pushDependencies?.store.loadContext, "function");
+  assert.equal(typeof store.pushDependencies?.google.insert, "function");
+});
+
 test("scheduled authorization compares the configured secret without logging it", async () => {
   const { createScheduledSyncHandler } = await scheduledApi;
   const messages = [];
@@ -104,11 +133,16 @@ test("scheduled authorization compares the configured secret without logging it"
   } finally { console.error = previous; }
 });
 
-test("schedule uses five-minute cron and Vault references without embedded credentials", async () => {
+test("schedule uses current household membership, five-minute cron, and Vault references", async () => {
   const sql = await readFile(new URL("../supabase/migrations/202608260002_google_sync_schedule.sql", import.meta.url), "utf8");
   assert.match(sql, /vault\.decrypted_secrets/);
   assert.match(sql, /project_url/);
   assert.match(sql, /google_sync_cron_secret/);
   assert.match(sql, /\*\/5 \* \* \* \*/);
   assert.doesNotMatch(sql, /Bearer\s+[A-Za-z0-9_-]{16,}/);
+  assert.match(sql, /household_members/);
+  assert.match(sql, /member\.household_id\s*=\s*google_connections\.household_id/);
+  assert.match(sql, /member\.user_id\s*=\s*p_user_id/);
+  assert.match(sql, /member\.household_id\s*=\s*conn\.household_id/);
+  assert.match(sql, /member\.user_id\s*=\s*conn\.user_id/);
 });

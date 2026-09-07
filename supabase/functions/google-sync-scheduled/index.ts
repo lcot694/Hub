@@ -3,6 +3,8 @@ import { createServiceClient, requiredServerEnv } from "../_shared/db.ts";
 import { pullCalendar, type PullCalendar, type PullDependencies } from "../_shared/pull-worker.ts";
 import { processPushJob, type ClaimedPushJob, type PushDependencies } from "../_shared/push-worker.ts";
 import { json } from "../_shared/http.ts";
+import { createSupabaseWorkerDependencies } from "../_shared/supabase-sync-store.ts";
+import type { GoogleClientDependencies } from "../_shared/google-client.ts";
 
 const CALENDAR_BATCH = 10;
 const JOB_BATCH = 25;
@@ -20,6 +22,7 @@ export interface ScheduledSyncDependencies {
   database?: SupabaseClient;
   pull?: (calendar: PullCalendar) => Promise<unknown>;
   push?: (job: ClaimedPushJob) => Promise<unknown>;
+  googleClient?: GoogleClientDependencies;
 }
 
 async function digest(value: string): Promise<Uint8Array> {
@@ -33,7 +36,10 @@ export async function constantSafeSecretEqual(left: string, right: string): Prom
   return difference === 0;
 }
 
-function databaseStore(database: SupabaseClient): ScheduledSyncStore {
+export function createScheduledDatabaseStore(
+  database: SupabaseClient,
+  googleClient: GoogleClientDependencies = {},
+): ScheduledSyncStore {
   return {
     async listDueCalendars(limit) {
       const { data, error } = await database.rpc("claim_google_sync_calendars", { p_limit: limit });
@@ -45,6 +51,7 @@ function databaseStore(database: SupabaseClient): ScheduledSyncStore {
       if (error) throw new Error("Queue batch unavailable");
       return (data ?? []) as ClaimedPushJob[];
     },
+    ...createSupabaseWorkerDependencies(database, googleClient),
   };
 }
 
@@ -59,16 +66,25 @@ export function createScheduledSyncHandler(dependencies: ScheduledSyncDependenci
     const configured = dependencies.env?.("SYNC_CRON_SECRET") ?? requiredServerEnv("SYNC_CRON_SECRET");
     if (!await constantSafeSecretEqual(bearer(req), configured)) return json(401, { error: "unauthorized" });
     try {
-      const store = dependencies.store ?? databaseStore(dependencies.database ?? createServiceClient());
+      const store = dependencies.store ?? createScheduledDatabaseStore(
+        dependencies.database ?? createServiceClient(),
+        dependencies.googleClient,
+      );
       const calendars = await store.listDueCalendars(CALENDAR_BATCH);
       const pull = dependencies.pull ?? ((calendar) => pullCalendar(calendar, store.pullDependencies!));
-      for (const calendar of calendars) await pull(calendar);
+      let failures = 0;
+      for (const calendar of calendars) {
+        try { await pull(calendar); } catch { failures += 1; }
+      }
       const jobs = await store.claimJobs(JOB_BATCH, LEASE_SECONDS);
       const push = dependencies.push ?? ((job) => processPushJob(job, store.pushDependencies!));
-      for (const job of jobs) await push(job);
+      for (const job of jobs) {
+        try { await push(job); } catch { failures += 1; }
+      }
       return json(200, {
         calendarsProcessed: calendars.length,
         jobsProcessed: jobs.length,
+        ...(failures ? { failures } : {}),
         workRemaining: calendars.length === CALENDAR_BATCH || jobs.length === JOB_BATCH,
       });
     } catch {
