@@ -135,6 +135,7 @@ $("signoutBtn").onclick=()=>supabase.auth.signOut().then(()=>location.reload());
 const googleSettings=createGoogleSettings({
   supabase,
   root:$("googleSettings"),
+  disconnectDialog:$("googleDisconnectDialog"),
   getContext:()=>({householdId:household?.id,people}),
   onChanged:()=>{fillEventCalendars($("eventCalendar").value||FAMILY_HUB_ONLY)}
 });

@@ -12,6 +12,8 @@ function fakeNode(id = "") {
     set textContent(value) { this._text = value; this.children = []; },
     append(...children) { this.children.push(...children); },
     replaceChildren(...children) { this._text = ""; this.children = children; },
+    showModal() { this.open = true; },
+    close() { this.open = false; },
     addEventListener(name, listener) { listeners.set(name, listener); },
     async fire(name) { return listeners.get(name)?.(); },
     querySelector(selector) {
@@ -41,6 +43,9 @@ function fakeDocument() {
 function settingsRoot() {
   const root = fakeNode("googleSettings");
   for (const id of ["googleConnectBtn", "googlePerson", "googleCalendarList", "googleSyncNowBtn", "googleDisconnectBtn"]) root.append(fakeNode(id));
+  const dialog = fakeNode("googleDisconnectDialog");
+  for (const id of ["googleKeepLocalBtn", "googleRemoveLocalBtn", "googleDisconnectCancelBtn", "googleDisconnectError"]) dialog.append(fakeNode(id));
+  root.append(dialog);
   return root;
 }
 
@@ -225,4 +230,54 @@ test("Sync now sends an explicit manual reason and app-open sync is callable", a
   assert.deepEqual(fixture.requests[2].options, { method: "POST", body: { reason: "app_open" } });
   fixture.requests[2].resolve({ data: { status: "syncing" }, error: null });
   await appOpen;
+});
+
+test("disconnect requires an explicit keep-local or remove-local choice", async () => {
+  for (const [buttonId, mode] of [["googleKeepLocalBtn", "keep_local"], ["googleRemoveLocalBtn", "remove_local"]]) {
+    const fixture = settingsFixture();
+    await loadInitialModel(fixture);
+    await fixture.root.querySelector("#googleDisconnectBtn").fire("click");
+    assert.equal(fixture.root.querySelector("#googleDisconnectDialog").open, true);
+    assert.equal(fixture.requests.length, 1);
+
+    const disconnecting = fixture.root.querySelector(`#${buttonId}`).fire("click");
+    assert.deepEqual(fixture.requests[1], {
+      name: "google-disconnect",
+      options: { method: "POST", body: { mode } },
+      resolve: fixture.requests[1].resolve,
+    });
+    assert.equal(controlsAreDisabled(fixture.root), true);
+    fixture.requests[1].resolve({ data: { disconnected: true, mode }, error: null });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(fixture.requests[2].name, "google-calendars");
+    fixture.requests[2].resolve({ data: { connection: { state: "disconnected" }, calendars: [] }, error: null });
+    await disconnecting;
+    assert.equal(fixture.root.querySelector("#googleDisconnectDialog").open, false);
+  }
+});
+
+test("disconnect failure stays sanitized and leaves the choice dialog usable", async () => {
+  const fixture = settingsFixture();
+  await loadInitialModel(fixture);
+  await fixture.root.querySelector("#googleDisconnectBtn").fire("click");
+  const disconnecting = fixture.root.querySelector("#googleKeepLocalBtn").fire("click");
+  fixture.requests[1].resolve({ data: null, error: new Error("secret database detail") });
+  await disconnecting;
+
+  assert.equal(fixture.root.querySelector("#googleDisconnectDialog").open, true);
+  assert.match(fixture.root.querySelector("#googleDisconnectError").textContent, /could not be disconnected/i);
+  assert.doesNotMatch(fixture.root.querySelector("#googleDisconnectError").textContent, /secret|database/i);
+  assert.equal(controlsAreDisabled(fixture.root), false);
+});
+
+test("disconnect ignores a repeated choice while the first request is pending", async () => {
+  const fixture = settingsFixture();
+  await loadInitialModel(fixture);
+  await fixture.root.querySelector("#googleDisconnectBtn").fire("click");
+  const first = fixture.root.querySelector("#googleKeepLocalBtn").fire("click");
+  await fixture.root.querySelector("#googleRemoveLocalBtn").fire("click");
+  assert.equal(fixture.requests.length, 2);
+
+  fixture.requests[1].resolve({ data: null, error: new Error("offline") });
+  await first;
 });

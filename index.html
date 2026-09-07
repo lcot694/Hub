@@ -163,6 +163,19 @@
     </div>
   </dialog>
 
+  <dialog id="googleDisconnectDialog" aria-labelledby="googleDisconnectTitle">
+    <div class="modal">
+      <h3 id="googleDisconnectTitle">Disconnect Google Calendar?</h3>
+      <p>Google events will not be deleted. Choose what happens to their Family Hub copies.</p>
+      <p id="googleDisconnectError" class="muted" aria-live="polite"></p>
+      <div class="modal-actions">
+        <button id="googleKeepLocalBtn" class="btn" type="button">Keep Family Hub copies</button>
+        <button id="googleRemoveLocalBtn" class="btn danger" type="button">Remove Family Hub copies</button>
+        <button id="googleDisconnectCancelBtn" class="btn" type="button">Cancel</button>
+      </div>
+    </div>
+  </dialog>
+
   <dialog id="shareDialog">
     <div class="modal center-text">
       <div class="eyebrow">Family code</div>
