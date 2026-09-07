@@ -17,12 +17,25 @@ create table if not exists public.google_pull_scans (
   google_calendar_id uuid not null references public.google_calendars(id) on delete cascade,
   generation bigint not null,
   started_at timestamptz not null default clock_timestamp(),
+  expected_sync_token text,
+  expected_sync_version timestamptz not null,
   candidate_versions jsonb not null default '{}'::jsonb,
   seen_google_event_ids text[] not null default '{}',
   unique (google_calendar_id, generation)
 );
 alter table public.google_pull_scans enable row level security;
 revoke all on table public.google_pull_scans from public, anon, authenticated;
+
+create table if not exists public.google_pull_cancellation_guards (
+  google_calendar_id uuid not null references public.google_calendars(id) on delete cascade,
+  family_event_id uuid not null references public.events(id) on delete cascade,
+  mapping_updated_at timestamptz not null,
+  family_updated_at timestamptz not null,
+  primary key (google_calendar_id, family_event_id)
+);
+alter table public.google_pull_cancellation_guards enable row level security;
+revoke all on table public.google_pull_cancellation_guards from public, anon, authenticated;
+
 
 create or replace function public.request_google_sync(
   p_user_id uuid,
@@ -166,66 +179,113 @@ $$;
 
 create or replace function public.apply_google_pull_page(p_calendar_id uuid, p_changes jsonb, p_reconciliation jsonb)
 returns void language plpgsql security definer set search_path = public as $$
-declare v_change jsonb; v_scan_id uuid := nullif(p_reconciliation#>>'{scan,scanId}', '')::uuid;
+declare
+  v_change jsonb; v_scan_id uuid := nullif(p_reconciliation#>>'{scan,scanId}', '')::uuid;
+  v_mapping public.google_event_mappings%rowtype; v_event public.events%rowtype;
+  v_event_id uuid; v_event_updated_at timestamptz; v_rows integer;
 begin
-  if not exists (select 1 from public.google_calendars cal join public.google_connections c on c.id=cal.google_connection_id
+  perform 1 from public.google_calendars cal join public.google_connections c on c.id=cal.google_connection_id
     join public.household_members member on member.household_id=c.household_id and member.user_id=c.user_id
-    where cal.id=p_calendar_id and cal.sync_token is not distinct from (p_reconciliation#>>'{run,expectedSyncToken}')
-      and cal.updated_at=(p_reconciliation#>>'{run,expectedSyncVersion}')::timestamptz)
-  then raise exception 'Google pull lease changed'; end if;
-  if v_scan_id is not null then update public.google_pull_scans set seen_google_event_ids =
-    array(select distinct unnest(seen_google_event_ids || array(select jsonb_array_elements_text(p_reconciliation->'seenGoogleEventIds'))))
-    where id=v_scan_id and google_calendar_id=p_calendar_id; end if;
+    where cal.id=p_calendar_id
+      and cal.updated_at=(p_reconciliation#>>'{run,expectedSyncVersion}')::timestamptz
+      and cal.sync_claimed_until > clock_timestamp()
+      and ((v_scan_id is null and cal.sync_token is not distinct from (p_reconciliation#>>'{run,expectedSyncToken}'))
+        or (v_scan_id is not null and cal.sync_token is null)) for update of cal;
+  if not found then raise exception 'Google pull lease changed'; end if;
+  if v_scan_id is not null and not exists (select 1 from public.google_pull_scans s where s.id=v_scan_id
+    and s.google_calendar_id=p_calendar_id and s.generation=(p_reconciliation#>>'{scan,generation}')::bigint
+    and s.expected_sync_token is not distinct from (p_reconciliation#>>'{run,expectedSyncToken}')
+    and s.expected_sync_version=(p_reconciliation#>>'{run,expectedSyncVersion}')::timestamptz)
+  then raise exception 'Google reconciliation lease changed'; end if;
+
   for v_change in select value from jsonb_array_elements(p_changes) loop
+    if v_change->>'kind' = 'ignore' then continue; end if;
     if v_change->>'kind' = 'import' then
-      with inserted as (insert into public.events(household_id,person_id,title,event_date,start_time,end_time,all_day,recurrence,recurrence_end,created_by)
-        select c.household_id, (v_change#>>'{familyEvent,person_id}')::uuid, v_change#>>'{familyEvent,title}',
-          (v_change#>>'{familyEvent,event_date}')::date, (v_change#>>'{familyEvent,start_time}')::time,
-          (v_change#>>'{familyEvent,end_time}')::time, (v_change#>>'{familyEvent,all_day}')::boolean,
-          v_change#>>'{familyEvent,recurrence}', (v_change#>>'{familyEvent,recurrence_end}')::date, c.user_id
-        from public.google_calendars cal join public.google_connections c on c.id=cal.google_connection_id where cal.id=p_calendar_id
-        returning id, updated_at)
-      insert into public.google_event_mappings(family_event_id,google_connection_id,google_calendar_id,google_event_id,google_etag,google_updated_at,last_family_updated_at,last_google_updated_at,sync_state)
-        select i.id, cal.google_connection_id, cal.id, v_change->>'googleEventId', v_change#>>'{mapping,google_etag}',
-          (v_change#>>'{mapping,google_updated_at}')::timestamptz, i.updated_at,
-          (v_change#>>'{mapping,last_google_updated_at}')::timestamptz, v_change#>>'{mapping,sync_state}'
-        from inserted i join public.google_calendars cal on cal.id=p_calendar_id
-        on conflict (google_connection_id,google_calendar_id,google_event_id) do nothing;
-    elsif v_change->>'kind' <> 'ignore' then
-      update public.google_event_mappings set google_etag=v_change#>>'{mapping,google_etag}',
-        google_updated_at=(v_change#>>'{mapping,google_updated_at}')::timestamptz,
-        last_google_updated_at=(v_change#>>'{mapping,last_google_updated_at}')::timestamptz,
-        sync_state=v_change#>>'{mapping,sync_state}', safe_error_message=v_change#>>'{mapping,safe_error_message}', updated_at=clock_timestamp()
-      where google_calendar_id=p_calendar_id and google_event_id=v_change->>'googleEventId'
-        and updated_at=(v_change#>>'{expected,mappingUpdatedAt}')::timestamptz;
-      if v_change->>'kind' in ('update','cancel') then
-        perform set_config('app.skip_google_event_queue','on',true);
-        update public.events e set title=coalesce(v_change#>>'{familyEventPatch,title}',e.title),
-          event_date=coalesce((v_change#>>'{familyEventPatch,event_date}')::date,e.event_date),
-          start_time=(v_change#>>'{familyEventPatch,start_time}')::time, end_time=(v_change#>>'{familyEventPatch,end_time}')::time,
-          all_day=coalesce((v_change#>>'{familyEventPatch,all_day}')::boolean,e.all_day),
-          recurrence=coalesce(v_change#>>'{familyEventPatch,recurrence}',e.recurrence),
-          recurrence_end=(v_change#>>'{familyEventPatch,recurrence_end}')::date,
-          sync_deleted_at=case when v_change->>'kind'='cancel' then clock_timestamp() else null end
-        where e.id=(v_change->>'familyEventId')::uuid and e.updated_at=(v_change#>>'{expected,familyUpdatedAt}')::timestamptz;
-      end if;
+      perform pg_advisory_xact_lock(hashtextextended(p_calendar_id::text || ':' || (v_change->>'googleEventId'), 0));
+      if exists(select 1 from public.google_event_mappings where google_calendar_id=p_calendar_id and google_event_id=v_change->>'googleEventId') then continue; end if;
+      insert into public.events(household_id,person_id,title,event_date,start_time,end_time,all_day,recurrence,recurrence_end,created_by)
+      select c.household_id,(v_change#>>'{familyEvent,person_id}')::uuid,v_change#>>'{familyEvent,title}',
+        (v_change#>>'{familyEvent,event_date}')::date,(v_change#>>'{familyEvent,start_time}')::time,
+        (v_change#>>'{familyEvent,end_time}')::time,(v_change#>>'{familyEvent,all_day}')::boolean,
+        v_change#>>'{familyEvent,recurrence}',(v_change#>>'{familyEvent,recurrence_end}')::date,c.user_id
+      from public.google_calendars cal join public.google_connections c on c.id=cal.google_connection_id where cal.id=p_calendar_id
+      returning id,updated_at into v_event_id,v_event_updated_at;
+      insert into public.google_event_mappings(family_event_id,google_connection_id,google_calendar_id,google_event_id,google_etag,google_updated_at,last_family_updated_at,last_google_updated_at,sync_state,safe_error_message)
+      select v_event_id,cal.google_connection_id,cal.id,v_change->>'googleEventId',v_change#>>'{mapping,google_etag}',
+        (v_change#>>'{mapping,google_updated_at}')::timestamptz,v_event_updated_at,
+        (v_change#>>'{mapping,last_google_updated_at}')::timestamptz,v_change#>>'{mapping,sync_state}',v_change#>>'{mapping,safe_error_message}'
+      from public.google_calendars cal where cal.id=p_calendar_id;
+      continue;
+    end if;
+
+    select m.* into v_mapping from public.google_event_mappings m where m.google_calendar_id=p_calendar_id
+      and m.google_event_id=v_change->>'googleEventId' for update;
+    if not found or v_mapping.updated_at is distinct from (v_change#>>'{expected,mappingUpdatedAt}')::timestamptz
+      then raise exception 'Stale Google mapping'; end if;
+    select * into v_event from public.events where id=v_mapping.family_event_id for update;
+    if not found or v_event.updated_at is distinct from (v_change#>>'{expected,familyUpdatedAt}')::timestamptz
+      then raise exception 'Stale Family event'; end if;
+    perform set_config('app.skip_google_event_queue','on',true);
+    if v_change->>'kind' in ('update','cancel') then
+      update public.events e set title=coalesce(v_change#>>'{familyEventPatch,title}',e.title),
+        event_date=coalesce((v_change#>>'{familyEventPatch,event_date}')::date,e.event_date),
+        start_time=(v_change#>>'{familyEventPatch,start_time}')::time,end_time=(v_change#>>'{familyEventPatch,end_time}')::time,
+        all_day=coalesce((v_change#>>'{familyEventPatch,all_day}')::boolean,e.all_day),
+        recurrence=coalesce(v_change#>>'{familyEventPatch,recurrence}',e.recurrence),
+        recurrence_end=(v_change#>>'{familyEventPatch,recurrence_end}')::date,
+        sync_deleted_at=case when v_change->>'kind'='cancel' then clock_timestamp() else null end,
+        updated_at=clock_timestamp() where e.id=v_event.id and e.updated_at=v_event.updated_at returning * into v_event;
+      get diagnostics v_rows = row_count; if v_rows<>1 then raise exception 'Stale Family event'; end if;
+    end if;
+    update public.google_event_mappings m set google_etag=v_change#>>'{mapping,google_etag}',
+      google_updated_at=(v_change#>>'{mapping,google_updated_at}')::timestamptz,
+      last_google_updated_at=(v_change#>>'{mapping,last_google_updated_at}')::timestamptz,
+      last_family_updated_at=v_event.updated_at,sync_state=v_change#>>'{mapping,sync_state}',
+      safe_error_message=v_change#>>'{mapping,safe_error_message}',updated_at=clock_timestamp()
+    where m.id=v_mapping.id and m.updated_at=v_mapping.updated_at returning * into v_mapping;
+    get diagnostics v_rows = row_count; if v_rows<>1 then raise exception 'Stale Google mapping'; end if;
+    if v_change->>'queuePolicy'='supersede_pending' then
+      update public.google_sync_queue set status='superseded',updated_at=clock_timestamp()
+      where family_event_id=v_event.id and status='pending';
+    elsif v_change->>'queuePolicy'='ensure_update' then
+      perform public.enqueue_google_event_change_internal(v_event.id,'update');
+    end if;
+    if v_change->>'kind'='cancel' then
+      insert into public.google_pull_cancellation_guards values(p_calendar_id,v_event.id,v_mapping.updated_at,v_event.updated_at)
+      on conflict (google_calendar_id,family_event_id) do update set mapping_updated_at=excluded.mapping_updated_at,family_updated_at=excluded.family_updated_at;
     end if;
   end loop;
+  if v_scan_id is not null then
+    update public.google_pull_scans set seen_google_event_ids=array(select distinct unnest(seen_google_event_ids ||
+      array(select jsonb_array_elements_text(p_reconciliation->'seenGoogleEventIds')))) where id=v_scan_id;
+    get diagnostics v_rows = row_count; if v_rows<>1 then raise exception 'Google reconciliation lease changed'; end if;
+  end if;
 end $$;
 
 create or replace function public.complete_google_incremental_pull(p_calendar_id uuid, p_run jsonb, p_next_sync_token text, p_cancellations jsonb)
 returns void language plpgsql security definer set search_path = public as $$
+declare v_rows integer;
 begin
-  update public.google_calendars set sync_token=p_next_sync_token,last_synced_at=clock_timestamp(),sync_claimed_until=null,updated_at=clock_timestamp()
-  where id=p_calendar_id and sync_token is not distinct from (p_run->>'expectedSyncToken')
-    and updated_at=(p_run->>'expectedSyncVersion')::timestamptz;
+  perform 1 from public.google_calendars where id=p_calendar_id
+    and sync_token is not distinct from (p_run->>'expectedSyncToken')
+    and updated_at=(p_run->>'expectedSyncVersion')::timestamptz
+    and sync_claimed_until > clock_timestamp() for update;
   if not found then raise exception 'Google pull lease changed'; end if;
-  delete from public.google_event_mappings m using public.events e
-    where m.family_event_id=e.id and m.google_calendar_id=p_calendar_id and e.id in
-      (select value::uuid from jsonb_array_elements_text(p_cancellations));
-  delete from public.events e where e.sync_deleted_at is not null and e.id in
-      (select value::uuid from jsonb_array_elements_text(p_cancellations))
-    and not exists(select 1 from public.google_event_mappings m where m.family_event_id=e.id);
+  delete from public.google_event_mappings m using public.events e,public.google_pull_cancellation_guards g
+    where m.family_event_id=e.id and g.google_calendar_id=p_calendar_id and g.family_event_id=e.id
+      and m.google_calendar_id=p_calendar_id and e.id in (select value::uuid from jsonb_array_elements_text(p_cancellations))
+      and m.updated_at=g.mapping_updated_at and e.updated_at=g.family_updated_at and e.sync_deleted_at is not null;
+  delete from public.events e using public.google_pull_cancellation_guards g
+    where g.google_calendar_id=p_calendar_id and g.family_event_id=e.id
+      and e.id in (select value::uuid from jsonb_array_elements_text(p_cancellations))
+      and e.updated_at=g.family_updated_at and e.sync_deleted_at is not null
+      and not exists(select 1 from public.google_event_mappings m where m.family_event_id=e.id);
+  delete from public.google_pull_cancellation_guards where google_calendar_id=p_calendar_id
+    and family_event_id in (select value::uuid from jsonb_array_elements_text(p_cancellations));
+  update public.google_calendars set sync_token=p_next_sync_token,last_synced_at=clock_timestamp(),sync_claimed_until=null,updated_at=clock_timestamp()
+    where id=p_calendar_id and sync_token is not distinct from (p_run->>'expectedSyncToken')
+      and updated_at=(p_run->>'expectedSyncVersion')::timestamptz;
+  get diagnostics v_rows = row_count; if v_rows<>1 then raise exception 'Google pull lease changed'; end if;
 end $$;
 
 create or replace function public.begin_google_full_reconciliation(p_calendar_id uuid, p_run jsonb)
@@ -234,11 +294,14 @@ declare v_generation bigint; v_scan_id uuid; v_started timestamptz:=clock_timest
 begin
   perform 1 from public.google_calendars where id=p_calendar_id
     and sync_token is not distinct from (p_run->>'expectedSyncToken')
-    and updated_at=(p_run->>'expectedSyncVersion')::timestamptz for update;
+    and updated_at=(p_run->>'expectedSyncVersion')::timestamptz
+    and sync_claimed_until > clock_timestamp() for update;
   if not found then raise exception 'Google pull lease changed'; end if;
   select coalesce(max(generation),0)+1 into v_generation from public.google_pull_scans where google_calendar_id=p_calendar_id;
-  insert into public.google_pull_scans(google_calendar_id,generation,started_at,candidate_versions)
-  select p_calendar_id,v_generation,v_started,coalesce(jsonb_object_agg(m.google_event_id,
+  update public.google_calendars set sync_token=null where id=p_calendar_id
+    and sync_token is not distinct from (p_run->>'expectedSyncToken') and updated_at=(p_run->>'expectedSyncVersion')::timestamptz;
+  insert into public.google_pull_scans(google_calendar_id,generation,started_at,expected_sync_token,expected_sync_version,candidate_versions)
+  select p_calendar_id,v_generation,v_started,p_run->>'expectedSyncToken',(p_run->>'expectedSyncVersion')::timestamptz,coalesce(jsonb_object_agg(m.google_event_id,
     jsonb_build_object('familyEventId',e.id,'mappingUpdatedAt',m.updated_at,'familyUpdatedAt',e.updated_at)),'{}'::jsonb)
   from public.google_event_mappings m join public.events e on e.id=m.family_event_id where m.google_calendar_id=p_calendar_id
   returning id into v_scan_id;
@@ -247,11 +310,14 @@ end $$;
 
 create or replace function public.finish_google_full_reconciliation(p_calendar_id uuid, p_scan jsonb, p_next_sync_token text, p_cancellations jsonb)
 returns void language plpgsql security definer set search_path = public as $$
-declare v_scan public.google_pull_scans%rowtype;
+declare v_scan public.google_pull_scans%rowtype; v_rows integer;
 begin
   select * into v_scan from public.google_pull_scans where id=(p_scan->>'scanId')::uuid
     and google_calendar_id=p_calendar_id and generation=(p_scan->>'generation')::bigint for update;
   if not found then raise exception 'Google reconciliation lease changed'; end if;
+  perform 1 from public.google_calendars where id=p_calendar_id and sync_token is null
+    and updated_at=v_scan.expected_sync_version and sync_claimed_until > clock_timestamp() for update;
+  if not found then raise exception 'Google pull lease changed'; end if;
   delete from public.google_event_mappings m using public.events e
     where m.family_event_id=e.id and m.google_calendar_id=p_calendar_id
       and not (m.google_event_id=any(v_scan.seen_google_event_ids))
@@ -259,21 +325,38 @@ begin
       and e.updated_at=(v_scan.candidate_versions#>>array[m.google_event_id,'familyUpdatedAt'])::timestamptz;
   delete from public.events e where not exists(select 1 from public.google_event_mappings m where m.family_event_id=e.id)
     and e.id in (select (value->>'familyEventId')::uuid from jsonb_each(v_scan.candidate_versions));
+  delete from public.google_event_mappings m using public.events e,public.google_pull_cancellation_guards g
+    where m.family_event_id=e.id and g.google_calendar_id=p_calendar_id and g.family_event_id=e.id
+      and e.id in (select value::uuid from jsonb_array_elements_text(p_cancellations))
+      and m.updated_at=g.mapping_updated_at and e.updated_at=g.family_updated_at and e.sync_deleted_at is not null;
+  delete from public.events e using public.google_pull_cancellation_guards g where g.google_calendar_id=p_calendar_id
+    and g.family_event_id=e.id and e.updated_at=g.family_updated_at and e.sync_deleted_at is not null
+    and not exists(select 1 from public.google_event_mappings m where m.family_event_id=e.id);
   update public.google_calendars set sync_token=p_next_sync_token,last_synced_at=clock_timestamp(),sync_claimed_until=null,updated_at=clock_timestamp()
-    where id=p_calendar_id;
+    where id=p_calendar_id and sync_token is null and updated_at=v_scan.expected_sync_version;
+  get diagnostics v_rows = row_count; if v_rows<>1 then raise exception 'Google pull lease changed'; end if;
+  delete from public.google_pull_cancellation_guards where google_calendar_id=p_calendar_id;
   delete from public.google_pull_scans where id=v_scan.id;
 end $$;
 
 create or replace function public.abort_google_full_reconciliation(p_calendar_id uuid, p_scan jsonb)
-returns void language sql security definer set search_path = public as $$
+returns void language plpgsql security definer set search_path = public as $$
+declare v_scan public.google_pull_scans%rowtype;
+begin
   delete from public.google_pull_scans where id=(p_scan->>'scanId')::uuid and google_calendar_id=p_calendar_id
-    and generation=(p_scan->>'generation')::bigint;
+    and generation=(p_scan->>'generation')::bigint returning * into v_scan;
+  if found then update public.google_calendars set sync_claimed_until=null
+    where id=p_calendar_id and sync_token is null and updated_at=v_scan.expected_sync_version; end if;
+end;
 $$;
 
-create or replace function public.record_google_pull_failure(p_calendar_id uuid, p_error_category text, p_safe_error_message text)
+create or replace function public.record_google_pull_failure(p_calendar_id uuid, p_run jsonb, p_error_category text, p_safe_error_message text)
 returns void language plpgsql security definer set search_path = public as $$
 begin
-  update public.google_calendars set sync_claimed_until=null,updated_at=clock_timestamp() where id=p_calendar_id;
+  update public.google_calendars set sync_claimed_until=null where id=p_calendar_id
+    and updated_at=(p_run->>'expectedSyncVersion')::timestamptz
+    and (sync_token is not distinct from (p_run->>'expectedSyncToken') or sync_token is null);
+  if not found then return; end if;
   update public.google_event_mappings set sync_state='needs_attention',safe_error_message=p_safe_error_message,updated_at=clock_timestamp()
     where google_calendar_id=p_calendar_id;
 end $$;
@@ -286,7 +369,7 @@ revoke all on function public.complete_google_incremental_pull(uuid,jsonb,text,j
 revoke all on function public.begin_google_full_reconciliation(uuid,jsonb) from public,anon,authenticated;
 revoke all on function public.finish_google_full_reconciliation(uuid,jsonb,text,jsonb) from public,anon,authenticated;
 revoke all on function public.abort_google_full_reconciliation(uuid,jsonb) from public,anon,authenticated;
-revoke all on function public.record_google_pull_failure(uuid,text,text) from public,anon,authenticated;
+revoke all on function public.record_google_pull_failure(uuid,jsonb,text,text) from public,anon,authenticated;
 revoke all on function public.mark_google_connection_reconnect(uuid,uuid) from public,anon,authenticated;
 grant execute on function public.load_google_push_context(uuid,uuid) to service_role;
 grant execute on function public.complete_google_push_job(uuid,uuid,jsonb) to service_role;
@@ -296,7 +379,7 @@ grant execute on function public.complete_google_incremental_pull(uuid,jsonb,tex
 grant execute on function public.begin_google_full_reconciliation(uuid,jsonb) to service_role;
 grant execute on function public.finish_google_full_reconciliation(uuid,jsonb,text,jsonb) to service_role;
 grant execute on function public.abort_google_full_reconciliation(uuid,jsonb) to service_role;
-grant execute on function public.record_google_pull_failure(uuid,text,text) to service_role;
+grant execute on function public.record_google_pull_failure(uuid,jsonb,text,text) to service_role;
 grant execute on function public.mark_google_connection_reconnect(uuid,uuid) to service_role;
 
 create or replace function public.claim_google_sync_calendars(p_limit integer)

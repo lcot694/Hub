@@ -117,6 +117,30 @@ test("production database composition supplies both worker stores and Google ada
   assert.equal(typeof store.pushDependencies?.google.insert, "function");
 });
 
+test("Supabase worker stores validate RPC results and send exact run guards", async () => {
+  const { createSupabasePullStore, createSupabasePushStore } = await import("../supabase/functions/_shared/supabase-sync-store.ts");
+  const calls = [];
+  const database = { rpc: async (name, parameters) => {
+    calls.push([name, parameters]);
+    if (name === "load_google_pull_mapping") return { data: null, error: null };
+    if (name === "load_google_push_context") return { data: null, error: null };
+    return { data: null, error: null };
+  } };
+  const calendar = { id: "calendar-1", sync_token: "old-token", sync_version: "2026-08-26T10:00:00.000Z" };
+  await createSupabasePullStore(database).recordFailure(calendar, "transient", "safe");
+  assert.deepEqual(calls[0], ["record_google_pull_failure", {
+    p_calendar_id: "calendar-1",
+    p_run: { expectedSyncToken: "old-token", expectedSyncVersion: "2026-08-26T10:00:00.000Z" },
+    p_error_category: "transient",
+    p_safe_error_message: "safe",
+  }]);
+  assert.equal(await createSupabasePullStore(database).loadMappedEvent(calendar, "remote-1"), null);
+  await assert.rejects(() => createSupabasePullStore(database).beginFullReconciliation(calendar, {
+    expectedSyncToken: "old-token", expectedSyncVersion: "2026-08-26T10:00:00.000Z",
+  }), /database operation failed/);
+  await assert.rejects(() => createSupabasePushStore(database).loadContext({ id: "job-1", claim_token: "claim-1" }), /database operation failed/);
+});
+
 test("scheduled authorization compares the configured secret without logging it", async () => {
   const { createScheduledSyncHandler } = await scheduledApi;
   const messages = [];
@@ -145,4 +169,8 @@ test("schedule uses current household membership, five-minute cron, and Vault re
   assert.match(sql, /member\.user_id\s*=\s*p_user_id/);
   assert.match(sql, /member\.household_id\s*=\s*conn\.household_id/);
   assert.match(sql, /member\.user_id\s*=\s*conn\.user_id/);
+  for (const token of [
+    "google_pull_cancellation_guards", "expected_sync_version", "get diagnostics v_rows = row_count",
+    "enqueue_google_event_change_internal", "pg_advisory_xact_lock", "candidate_versions",
+  ]) assert.match(sql, new RegExp(token));
 });

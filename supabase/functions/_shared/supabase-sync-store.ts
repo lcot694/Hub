@@ -30,9 +30,17 @@ async function rpc<T>(database: RpcClient, name: string, parameters: Record<stri
   return data as T;
 }
 
+async function requiredRpc<T>(database: RpcClient, name: string, parameters: Record<string, unknown>): Promise<T> {
+  const value = await rpc<T | null>(database, name, parameters);
+  if (value === null || value === undefined || typeof value !== "object") {
+    throw new Error("Google synchronization database operation failed");
+  }
+  return value;
+}
+
 export function createSupabasePushStore(database: RpcClient): PushStore {
   return {
-    loadContext: (job: ClaimedPushJob) => rpc<PushContext>(database, "load_google_push_context", {
+    loadContext: (job: ClaimedPushJob) => requiredRpc<PushContext>(database, "load_google_push_context", {
       p_job_id: job.id,
       p_claim_token: job.claim_token,
     }),
@@ -76,7 +84,7 @@ export function createSupabasePullStore(database: RpcClient): PullStore {
       "complete_google_incremental_pull",
       { p_calendar_id: calendar.id, p_run: run, p_next_sync_token: nextSyncToken, p_cancellations: cancellations },
     ),
-    beginFullReconciliation: (calendar: PullCalendar, run: PullRunGuard) => rpc<FullReconciliationScan>(
+    beginFullReconciliation: (calendar: PullCalendar, run: PullRunGuard) => requiredRpc<FullReconciliationScan>(
       database,
       "begin_google_full_reconciliation",
       { p_calendar_id: calendar.id, p_run: run },
@@ -98,7 +106,12 @@ export function createSupabasePullStore(database: RpcClient): PullStore {
     recordFailure: (calendar: PullCalendar, category: PullErrorCategory, safeMessage: string) => rpc<void>(
       database,
       "record_google_pull_failure",
-      { p_calendar_id: calendar.id, p_error_category: category, p_safe_error_message: safeMessage },
+      {
+        p_calendar_id: calendar.id,
+        p_run: { expectedSyncToken: calendar.sync_token, expectedSyncVersion: calendar.sync_version },
+        p_error_category: category,
+        p_safe_error_message: safeMessage,
+      },
     ),
   };
 }
