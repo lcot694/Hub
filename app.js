@@ -56,6 +56,7 @@ async function loadHousehold(){
   subscribeRealtime();
   showScreen("app");
   render();
+  googleSettings.requestSync("app_open").catch(() => {});
   if(new URLSearchParams(location.search).get("google")==="connected"){
     googleSettings.load();
     history.replaceState({},"",location.pathname);

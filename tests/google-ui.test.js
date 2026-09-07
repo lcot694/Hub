@@ -210,3 +210,19 @@ test("controls stay disabled until every overlapping operation settles", async (
   await saving;
   assert.equal(controlsAreDisabled(fixture.root), false);
 });
+
+test("Sync now sends an explicit manual reason and app-open sync is callable", async () => {
+  const fixture = settingsFixture();
+  await loadInitialModel(fixture);
+
+  const manual = fixture.root.querySelector("#googleSyncNowBtn").fire("click");
+  assert.deepEqual(fixture.requests[1].name, "google-sync");
+  assert.deepEqual(fixture.requests[1].options, { method: "POST", body: { reason: "manual" } });
+  fixture.requests[1].resolve({ data: { status: "syncing" }, error: null });
+  await manual;
+
+  const appOpen = fixture.settings.requestSync("app_open");
+  assert.deepEqual(fixture.requests[2].options, { method: "POST", body: { reason: "app_open" } });
+  fixture.requests[2].resolve({ data: { status: "syncing" }, error: null });
+  await appOpen;
+});
