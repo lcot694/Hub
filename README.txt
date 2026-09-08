@@ -56,10 +56,11 @@ order:
 11. 202609080001_google_sync_final_hardening.sql
 12. 202609080002_google_reconnect_failure_fence.sql
 13. 202609080003_google_stale_authorization_queue_fix.sql
+14. 202609080004_google_stale_authorization_successor_order.sql
 
 EXISTING V2 UPGRADE
 Do not reapply schema.sql: the baseline already exists. Back up the database,
-then apply the same thirteen migration files above in exact filename order. Before
+then apply the same fourteen migration files above in exact filename order. Before
 the hardening migration, inspect google_connections for duplicate user_id
 values. That migration stops with google_connection_duplicate_users instead of
 choosing which account and dependent rows to remove. Review and explicitly
