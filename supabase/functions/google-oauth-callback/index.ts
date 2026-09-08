@@ -39,6 +39,12 @@ interface OAuthCallbackDependencies {
   encrypt?: typeof encryptToken;
 }
 
+interface OAuthPersistenceInput {
+  userId: string; householdId: string; personId: string; connectionGeneration: number;
+  googleAccountId: string; displayEmail: string | null; accessTokenEncrypted: string;
+  refreshTokenEncrypted: string | null; tokenExpiresAt: string;
+}
+
 interface FlowContext {
   personId: string;
   pkceVerifier: string;
@@ -60,16 +66,6 @@ interface GoogleTokens {
 interface GoogleUserInfo {
   sub: string;
   email: string | null;
-}
-
-interface ExistingConnection {
-  id: string;
-  user_id: string;
-  household_id: string;
-  person_id: string;
-  google_account_id: string;
-  refresh_token_encrypted: string | null;
-  oauth_generation: number;
 }
 
 class OAuthCallbackError extends Error {
@@ -265,17 +261,25 @@ async function loadGoogleUser(
   };
 }
 
-async function findUserConnection(
-  database: SupabaseClient,
-  userId: string,
-): Promise<ExistingConnection | null> {
-  const { data, error } = await database
-    .from("google_connections")
-    .select("id,user_id,household_id,person_id,google_account_id,refresh_token_encrypted,oauth_generation")
-    .eq("user_id", userId)
-    .maybeSingle();
+export async function persistOAuthConnection(database: SupabaseClient, input: OAuthPersistenceInput): Promise<void> {
+  const { data, error } = await database.rpc("persist_google_oauth_connection", {
+    p_user_id: input.userId, p_household_id: input.householdId, p_person_id: input.personId,
+    p_connection_generation: input.connectionGeneration, p_google_account_id: input.googleAccountId,
+    p_display_email: input.displayEmail, p_access_token_encrypted: input.accessTokenEncrypted,
+    p_refresh_token_encrypted: input.refreshTokenEncrypted, p_token_expires_at: input.tokenExpiresAt,
+  });
   if (error) throw new OAuthCallbackError("connection_failed");
-  return data as ExistingConnection | null;
+  if (data === "ok") return;
+  if (SANITIZED_ERROR_CODES.has(data)) throw new OAuthCallbackError(data as SanitizedErrorCode);
+  throw new OAuthCallbackError("connection_failed");
+}
+
+async function requireCurrentGeneration(database: SupabaseClient, flow: ConsumedFlow): Promise<void> {
+  const { data, error } = await database.rpc("is_current_google_oauth_generation", {
+    p_user_id: flow.user_id, p_connection_generation: flow.connection_generation,
+  });
+  if (error) throw new OAuthCallbackError("connection_failed");
+  if (data !== true) throw new OAuthCallbackError("invalid_state");
 }
 
 async function saveConnection(
@@ -284,67 +288,22 @@ async function saveConnection(
   context: FlowContext,
   tokens: GoogleTokens,
   userinfo: GoogleUserInfo,
-  existing: ExistingConnection | null,
   now: Date,
   env: (name: string) => string,
   encrypt: typeof encryptToken,
 ): Promise<void> {
   const encryptionKey = env("GOOGLE_TOKEN_ENCRYPTION_KEY");
-  if (
-    existing &&
-    (existing.household_id !== flow.household_id || existing.person_id !== context.personId)
-  ) {
-    throw new OAuthCallbackError("context_mismatch");
-  }
-  if ((existing?.oauth_generation ?? 0) !== flow.connection_generation) {
-    throw new OAuthCallbackError("invalid_state");
-  }
-
   const accessTokenEncrypted = await encrypt(tokens.access_token, encryptionKey);
   const refreshTokenEncrypted = tokens.refresh_token
     ? await encrypt(tokens.refresh_token, encryptionKey)
-    : existing?.refresh_token_encrypted;
-  if (!refreshTokenEncrypted) {
-    throw new OAuthCallbackError("refresh_token_required");
-  }
+    : null;
   const tokenExpiresAt = new Date(now.getTime() + tokens.expires_in * 1000).toISOString();
 
-  const credentialValues = {
-    display_email: userinfo.email,
-    access_token_encrypted: accessTokenEncrypted,
-    refresh_token_encrypted: refreshTokenEncrypted,
-    token_expires_at: tokenExpiresAt,
-    connection_state: "active",
-    last_error: null,
-    updated_at: now.toISOString(),
-    disconnected_at: null,
-  };
-
-  if (existing) {
-    const { data, error } = await database.from("google_connections").update(credentialValues)
-      .eq("id", existing.id)
-      .eq("user_id", flow.user_id)
-      .eq("oauth_generation", flow.connection_generation)
-      .select("id");
-    if (
-      error ||
-      !Array.isArray(data) ||
-      data.length !== 1 ||
-      data[0]?.id !== existing.id
-    ) {
-      throw new OAuthCallbackError("connection_failed");
-    }
-    return;
-  }
-
-  const { error } = await database.from("google_connections").insert({
-    user_id: flow.user_id,
-    household_id: flow.household_id,
-    person_id: context.personId,
-    google_account_id: userinfo.sub,
-    ...credentialValues,
+  await persistOAuthConnection(database, {
+    userId: flow.user_id, householdId: flow.household_id, personId: context.personId,
+    connectionGeneration: flow.connection_generation, googleAccountId: userinfo.sub,
+    displayEmail: userinfo.email, accessTokenEncrypted, refreshTokenEncrypted, tokenExpiresAt,
   });
-  if (error) throw new OAuthCallbackError("connection_failed");
 }
 
 export async function handleOAuthCallback(
@@ -375,16 +334,10 @@ export async function handleOAuthCallback(
       throw new OAuthCallbackError("invalid_request");
     }
     await verifyFlowAuthorization(database, flow, context);
-    const existing = await findUserConnection(database, flow.user_id);
-    if ((existing?.oauth_generation ?? 0) !== flow.connection_generation) {
-      throw new OAuthCallbackError("invalid_state");
-    }
+    await requireCurrentGeneration(database, flow);
     const tokens = await exchangeCode(code, context.pkceVerifier, fetchImplementation, env);
     const userinfo = await loadGoogleUser(tokens.access_token, fetchImplementation);
-    if (existing && existing.google_account_id !== userinfo.sub) {
-      throw new OAuthCallbackError("account_switch_requires_disconnect");
-    }
-    await saveConnection(database, flow, context, tokens, userinfo, existing, now, env, encrypt);
+    await saveConnection(database, flow, context, tokens, userinfo, now, env, encrypt);
     return appRedirect(appOrigin);
   } catch (error) {
     const code = error instanceof OAuthCallbackError ? error.code : "connection_failed";

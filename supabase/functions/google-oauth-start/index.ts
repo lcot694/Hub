@@ -88,16 +88,18 @@ async function verifyOwnedPerson(
   }
 }
 
-async function currentConnectionGeneration(database: SupabaseClient, userId: string): Promise<number> {
-  const { data, error } = await database.from("google_connections")
-    .select("oauth_generation").eq("user_id", userId).maybeSingle();
-  if (error) throw new HttpError(503, "oauth_unavailable", "Google connection could not be started");
-  if (!data) return 0;
-  const generation = data.oauth_generation;
-  if (!Number.isSafeInteger(generation) || generation < 0) {
+export async function createOAuthFlow(database: SupabaseClient, flow: {
+  userId: string; householdId: string; stateHash: string; flowContext: string; expiresAt: string;
+}): Promise<number> {
+  const { data, error } = await database.rpc("begin_google_oauth_flow", {
+    p_user_id: flow.userId, p_household_id: flow.householdId,
+    p_state_hash: flow.stateHash, p_flow_context: flow.flowContext,
+    p_expires_at: flow.expiresAt,
+  });
+  if (error || !Number.isSafeInteger(data) || data < 1) {
     throw new HttpError(503, "oauth_unavailable", "Google connection could not be started");
   }
-  return generation;
+  return data;
 }
 
 export async function handleOAuthStart(
@@ -121,7 +123,6 @@ export async function handleOAuthStart(
     const { userId } = await authenticate(req);
     const { householdId, personId } = await readInput(req);
     await verifyOwnedPerson(database, userId, householdId, personId);
-    const connectionGeneration = await currentConnectionGeneration(database, userId);
 
     const state = randomBase64Url(32);
     const pkceVerifier = randomBase64Url(64);
@@ -135,17 +136,7 @@ export async function handleOAuthStart(
     // This private legacy column carries callback-only context. It is never
     // interpreted as a URL or used to choose the eventual app redirect.
     const flowContext = JSON.stringify({ version: 1, personId, pkceVerifier });
-    const { error: flowError } = await database.from("google_oauth_flows").insert({
-      user_id: userId,
-      household_id: householdId,
-      connection_generation: connectionGeneration,
-      state_hash: stateHash,
-      redirect_path: flowContext,
-      expires_at: expiresAt,
-    });
-    if (flowError) {
-      throw new HttpError(503, "oauth_unavailable", "Google connection could not be started");
-    }
+    await createOAuthFlow(database, { userId, householdId, stateHash, flowContext, expiresAt });
 
     const authorizationUrl = new URL(GOOGLE_AUTHORIZATION_ENDPOINT);
     authorizationUrl.searchParams.set("client_id", env("GOOGLE_CLIENT_ID"));

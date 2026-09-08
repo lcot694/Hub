@@ -53,10 +53,19 @@ async function withDenoEnv(run) {
   }
 }
 
-function startDatabase({ membership = true, person = true, flowError = null, connectionGeneration = 0 } = {}) {
+function startDatabase({ membership = true, person = true, flowError = null, connectionGeneration = 1 } = {}) {
   const insertedFlows = [];
   return {
     insertedFlows,
+    rpc(name, args) {
+      if (name !== "begin_google_oauth_flow") throw new Error(`Unexpected RPC: ${name}`);
+      insertedFlows.push({
+        user_id: args.p_user_id, household_id: args.p_household_id,
+        connection_generation: connectionGeneration, state_hash: args.p_state_hash,
+        redirect_path: args.p_flow_context, expires_at: args.p_expires_at,
+      });
+      return Promise.resolve({ data: connectionGeneration, error: flowError });
+    },
     from(table) {
       if (table === "household_members" || table === "people") {
         const found = table === "household_members" ? membership : person;
@@ -107,6 +116,28 @@ function callbackDatabase({
   return {
     calls,
     writes,
+    rpc(name, args) {
+      calls.push(["rpc", name, args]);
+      if (name === "is_current_google_oauth_generation") {
+        const current = existing ? existing.oauth_generation === args.p_connection_generation : true;
+        return Promise.resolve({ data: current, error: null });
+      }
+      if (name === "persist_google_oauth_connection") {
+        if (connectionUpdateRows?.length === 0) return Promise.resolve({ data: "invalid_state", error: null });
+        if (existing && (existing.household_id !== args.p_household_id || existing.person_id !== args.p_person_id)) {
+          return Promise.resolve({ data: "context_mismatch", error: null });
+        }
+        if (existing && existing.google_account_id !== args.p_google_account_id) {
+          return Promise.resolve({ data: "account_switch_requires_disconnect", error: null });
+        }
+        if (!args.p_refresh_token_encrypted && !existing?.refresh_token_encrypted) {
+          return Promise.resolve({ data: "refresh_token_required", error: null });
+        }
+        writes.push({ operation: existing ? "update" : "insert", values: args });
+        return Promise.resolve({ data: "ok", error: null });
+      }
+      throw new Error(`Unexpected RPC: ${name}`);
+    },
     from(table) {
       calls.push(["from", table]);
       if (table === "google_oauth_flows") {
@@ -237,7 +268,7 @@ test("OAuth start returns the exact authorization contract and ten-minute expiry
   ]);
 });
 
-test("OAuth start snapshots the current connection generation into the flow", async () => {
+test("OAuth start stores its allocated connection generation in the flow", async () => {
   const { handleOAuthStart } = await oauthStart;
   const database = startDatabase({ connectionGeneration: 7 });
   const response = await withDenoEnv(() => handleOAuthStart(new Request(
@@ -254,6 +285,26 @@ test("OAuth start snapshots the current connection generation into the flow", as
 
   assert.equal(response.status, 200);
   assert.equal(database.insertedFlows[0].connection_generation, 7);
+});
+
+test("every OAuth start atomically allocates a newer generation with its flow", async () => {
+  const { createOAuthFlow } = await oauthStart;
+  let generation = 4;
+  const calls = [];
+  const database = { rpc: async (name, args) => {
+    calls.push([name, args]);
+    generation += 1;
+    return { data: generation, error: null };
+  } };
+  const row = {
+    userId: USER_ID, householdId: HOUSEHOLD_ID, stateHash: "hash",
+    flowContext: "context", expiresAt: "2026-08-27T12:10:00.000Z",
+  };
+
+  assert.equal(await createOAuthFlow(database, row), 5);
+  assert.equal(await createOAuthFlow(database, { ...row, stateHash: "hash-2" }), 6);
+  assert.equal(calls[0][0], "begin_google_oauth_flow");
+  assert.equal(calls[0][1].p_user_id, USER_ID);
 });
 
 test("OAuth start preserves allowed-origin CORS headers on every sanitized error", async (t) => {
@@ -376,9 +427,8 @@ test("OAuth reconnect preserves the encrypted refresh token when Google omits ro
   assert.equal(response.headers.get("Location"), `${APP_ORIGIN}/?google=connected`);
   assert.equal(database.writes.length, 1);
   assert.equal(database.writes[0].operation, "update");
-  assert.equal(database.writes[0].values.refresh_token_encrypted, "encrypted:old-refresh");
-  assert.equal(database.writes[0].values.household_id, undefined);
-  assert.equal(database.writes[0].values.person_id, undefined);
+  assert.equal(database.writes[0].values.p_refresh_token_encrypted, null);
+  assert.equal(database.writes[0].values.p_connection_generation, 4);
 });
 
 test("a flow created before disconnect is rejected before Google access", async () => {
@@ -415,9 +465,62 @@ test("disconnect winning after callback validation prevents credential persisten
 
   const response = await handleOAuthCallback(callbackRequest(), callbackDependencies(database, google.implementation));
 
-  assert.equal(response.headers.get("Location"), `${APP_ORIGIN}/?google=error&code=connection_failed`);
-  assert.equal(database.writes.length, 1);
-  assert.ok(database.calls.some((call) => call[0] === "connection-generation-eq" && call[1] === 0));
+  assert.equal(response.headers.get("Location"), `${APP_ORIGIN}/?google=error&code=invalid_state`);
+  assert.equal(database.writes.length, 0);
+  const persistence = database.calls.find((call) => call[0] === "rpc" && call[1] === "persist_google_oauth_connection");
+  assert.equal(persistence[2].p_connection_generation, 0);
+});
+
+test("callbacks completing in reverse order cannot overwrite newer credentials", async () => {
+  const { persistOAuthConnection } = await oauthCallback;
+  let latestGeneration = 2;
+  let storedAccess = null;
+  const database = { rpc: async (_name, args) => {
+    if (args.p_connection_generation !== latestGeneration) return { data: "invalid_state", error: null };
+    storedAccess = args.p_access_token_encrypted;
+    return { data: "ok", error: null };
+  } };
+  const base = {
+    userId: USER_ID, householdId: HOUSEHOLD_ID, personId: PERSON_ID,
+    googleAccountId: "google-account", displayEmail: "adult@example.com",
+    refreshTokenEncrypted: "encrypted:new-refresh", tokenExpiresAt: "2026-08-27T13:00:00.000Z",
+  };
+
+  await persistOAuthConnection(database, { ...base, connectionGeneration: 2, accessTokenEncrypted: "encrypted:new-access" });
+  await assert.rejects(
+    persistOAuthConnection(database, { ...base, connectionGeneration: 1, accessTokenEncrypted: "encrypted:old-access" }),
+    (error) => error.code === "invalid_state",
+  );
+  assert.equal(storedAccess, "encrypted:new-access");
+});
+
+test("a callback without a rotated refresh token delegates preservation to the locked persistence RPC", async () => {
+  const { persistOAuthConnection } = await oauthCallback;
+  let args;
+  const database = { rpc: async (_name, values) => { args = values; return { data: "ok", error: null }; } };
+
+  await persistOAuthConnection(database, {
+    userId: USER_ID, householdId: HOUSEHOLD_ID, personId: PERSON_ID, connectionGeneration: 8,
+    googleAccountId: "google-account", displayEmail: null,
+    accessTokenEncrypted: "encrypted:access", refreshTokenEncrypted: null,
+    tokenExpiresAt: "2026-08-27T13:00:00.000Z",
+  });
+
+  assert.equal(args.p_refresh_token_encrypted, null);
+  assert.equal(args.p_connection_generation, 8);
+});
+
+test("successful OAuth persistence consumes its exact generation inside the locked transaction", async () => {
+  const sql = await readFile(new URL("../supabase/migrations/202608270008_google_oauth_generation_serialization.sql", import.meta.url), "utf8");
+  assert.match(sql, /select generation into v_latest[\s\S]*for update/i);
+  assert.match(sql, /v_latest <> p_connection_generation[\s\S]*return 'invalid_state'/i);
+  assert.match(sql, /update public\.google_oauth_generations[\s\S]*generation = generation \+ 1[\s\S]*where user_id=p_user_id and generation=p_connection_generation/i);
+  assert.match(sql, /refresh_token_encrypted=coalesce\(p_refresh_token_encrypted, refresh_token_encrypted\)/i);
+  assert.match(sql, /redirect_path='\{\}'/i);
+  assert.match(sql, /set consumed_at=coalesce\(consumed_at,clock_timestamp\(\)\), redirect_path='\{\}'/i);
+  assert.match(sql, /revoke all on function public\.persist_google_oauth_connection[\s\S]*grant execute[\s\S]*to service_role/i);
+  assert.match(sql, /public\.household_members[\s\S]*user_id=p_user_id[\s\S]*household_id=p_household_id/i);
+  assert.match(sql, /public\.people[\s\S]*id=p_person_id[\s\S]*household_id=p_household_id/i);
 });
 
 test("OAuth callback rejects switching to another Google account for the same adult", async () => {
@@ -464,11 +567,11 @@ test("OAuth start uses random hashed state, PKCE S256, and a ten-minute flow", a
 
   assert.match(start, /crypto\.getRandomValues/);
   assert.match(start, /crypto\.subtle\.digest\(\s*["']SHA-256["']/);
-  assert.match(start, /state_hash:\s*stateHash/);
+  assert.match(start, /stateHash/);
   assert.match(start, /pkceVerifier/);
   assert.match(start, /10\s*\*\s*60\s*\*\s*1000/);
   assert.match(start, /code_challenge_method["']?\s*,\s*["']S256["']/);
-  assert.doesNotMatch(start, /state_hash:\s*state(?:\s*[,}])/);
+  assert.doesNotMatch(start, /p_state_hash:\s*state(?:\s*[,}])/);
 });
 
 test("OAuth authorization request uses the configured callback and required consent contract", async () => {
@@ -516,9 +619,8 @@ test("OAuth callback encrypts credentials and persists the stable Google account
   assert.match(callback, /encrypt\(\s*tokens\.access_token/);
   assert.match(callback, /encrypt\(\s*tokens\.refresh_token/);
   assert.match(callback, /dependencies\.encrypt\s*\?\?\s*encryptToken/);
-  assert.match(callback, /from\(\s*["']google_connections["']\s*\)/);
-  assert.match(callback, /from\(\s*["']google_connections["']\s*\)\.insert/);
-  assert.match(callback, /from\(\s*["']google_connections["']\s*\)\.update/);
+  assert.match(callback, /persist_google_oauth_connection/);
+  assert.doesNotMatch(callback, /from\(\s*["']google_connections["']\s*\)\.(?:insert|update)/);
   assert.doesNotMatch(callback, /\.upsert\(/);
   assert.doesNotMatch(callback, /access_token:\s*tokens\.access_token/);
   assert.doesNotMatch(callback, /refresh_token:\s*tokens\.refresh_token/);
