@@ -12,6 +12,8 @@ The first release synchronizes event title, date, start and end time, all-day st
 
 The first release excludes attendee and invitation management, Google Meet management, moving an existing event between different adults' Google accounts, and edited individual occurrences or other complex recurrence rules.
 
+Family Hub keeps its month-end clamping behavior for local monthly series and its February 29-to-February 28 behavior for local yearly series. Because a standard Google RRULE skips those nonexistent anniversary dates instead of clamping them, monthly series starting after the 28th and yearly series starting on February 29 are not synchronized as writable simple recurrence. They remain local when created in Family Hub, and matching Google series are surfaced as read-only, so the two calendars never claim parity while displaying different occurrences.
+
 ## Existing Application
 
 The current application is a static GitHub Pages PWA. Browser JavaScript authenticates with Supabase and accesses households, household memberships, people, and events under Row Level Security. Events and people update through Supabase Realtime. The service worker provides shell caching.

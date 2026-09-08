@@ -516,6 +516,67 @@ test("unsupported complex recurrence becomes read-only without overwriting mappe
   assert.doesNotMatch(JSON.stringify(change), /Private changed title/);
 });
 
+test("an incremental recurrence exception marks its mapped parent read-only", async () => {
+  const { pullCalendar } = await pullWorker;
+  const deps = fakePullDeps({
+    records: [mappedRecord("series")],
+    pages: [{ items: [googleEvent("exception-1", {
+      recurringEventId: "series",
+      originalStartTime: { dateTime: "2026-09-09T18:00:00-04:00" },
+    })], nextSyncToken: NEXT_SYNC_TOKEN }],
+  });
+
+  await pullCalendar(calendar(), deps);
+
+  assert.equal(deps.records.get("series").familyEvent.title, "Old local title");
+  assert.equal(deps.records.get("series").mapping.sync_state, "read_only");
+  assert.equal(deps.records.get("series").mapping.safe_error_message,
+    "Google event has an unsupported recurrence exception");
+  assert.deepEqual(calls(deps, "apply")[0][3].seenGoogleEventIds, ["exception-1", "series"]);
+});
+
+test("an exception before its master protects and marks the later imported parent read-only", async () => {
+  const { pullCalendar } = await pullWorker;
+  const deps = fakePullDeps({ pages: [
+    { items: [googleEvent("exception-first", {
+      recurringEventId: "series-later",
+      originalStartTime: { dateTime: "2026-09-09T18:00:00-04:00" },
+    })], nextPageToken: "master-page" },
+    { items: [googleEvent("series-later", {
+      recurrence: ["RRULE:FREQ=WEEKLY"],
+    })], nextSyncToken: NEXT_SYNC_TOKEN },
+  ] });
+
+  await pullCalendar(calendar({ sync_token: null }), deps);
+
+  assert.equal(deps.records.get("series-later").mapping.sync_state, "read_only");
+  assert.equal(deps.records.get("series-later").mapping.safe_error_message,
+    "Google event has an unsupported recurrence exception");
+  assert.deepEqual(calls(deps, "apply").map((entry) => entry[3].seenGoogleEventIds), [
+    ["exception-first", "series-later"],
+    ["series-later"],
+  ]);
+});
+
+test("a master and exception on the same page produce one parent change", async () => {
+  const { pullCalendar } = await pullWorker;
+  const deps = fakePullDeps({
+    records: [mappedRecord("series-same-page")],
+    pages: [{ items: [
+      googleEvent("series-same-page", { recurrence: ["RRULE:FREQ=WEEKLY"] }),
+      googleEvent("exception-same-page", {
+        recurringEventId: "series-same-page",
+        originalStartTime: { dateTime: "2026-09-09T18:00:00-04:00" },
+      }),
+    ], nextSyncToken: NEXT_SYNC_TOKEN }],
+  });
+
+  await pullCalendar(calendar(), deps);
+
+  assert.equal(deps.records.get("series-same-page").mapping.sync_state, "read_only");
+  assert.equal(calls(deps, "apply")[0][2].length, 1);
+});
+
 test("an expired sync token clears it and performs a full reconciliation", async () => {
   const { pullCalendar } = await pullWorker;
   const expired = Object.assign(new Error("expired token detail"), { status: 410 });

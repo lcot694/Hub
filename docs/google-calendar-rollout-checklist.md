@@ -40,6 +40,8 @@ For each check, record `PASS`, `FAIL`, or `N/A`, plus a brief sanitized note.
 | ___ | Sync a weekly recurring event and confirm its frequency and end date. | ____________________ |
 | ___ | Sync a monthly recurring event and confirm its frequency and end date. | ____________________ |
 | ___ | Sync a yearly recurring event and confirm its frequency and end date. | ____________________ |
+| ___ | Confirm a monthly series starting after the 28th and a yearly February 29 series stay local/read-only rather than showing different occurrences in Google. | ____________________ |
+| ___ | Edit one Google occurrence and confirm the parent series remains visible, protected, and marked read-only after incremental sync. | ____________________ |
 | ___ | Edit the same event in both systems before the next sync; confirm deterministic conflict handling without silent data loss or duplication. | ____________________ |
 | ___ | Enable or encounter a read-only calendar/event; confirm it remains visible, clearly read-only, and cannot be written from Family Hub. | ____________________ |
 | ___ | Choose delete everywhere for a synchronized event; confirm both copies are removed and the operation is not repeated. | ____________________ |

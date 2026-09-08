@@ -289,6 +289,7 @@ const SAFE_MESSAGES: Record<PullErrorCategory, string> = {
 const READ_ONLY_MESSAGES: Record<string, string> = {
   complex_recurrence: "Google event has an unsupported recurrence pattern",
   complex_recurrence_exception: "Google event has an unsupported recurrence exception",
+  recurrence_occurrence_mismatch: "Google recurrence cannot preserve Family Hub month-end occurrences",
   recurring_time_zone_mismatch: "Google recurring event uses a different time zone",
   multi_day_event: "Google multi-day event is read-only",
   ambiguous_local_time: "Google event has an ambiguous local time",
@@ -470,12 +471,35 @@ async function changeForEvent(
   calendar: PullCalendar,
   dependencies: PullDependencies,
   event: GooglePullEvent,
+  protectedParentIds: ReadonlySet<string>,
 ): Promise<PullChange> {
   if (!event || typeof event.id !== "string" || !event.id) {
     throw new GooglePullError("validation", 502);
   }
-  const mapped = await dependencies.store.loadMappedEvent(calendar, event.id);
-  if (mapped) assertMappedScope(calendar, mapped, event.id);
+  const parentId = typeof event.recurringEventId === "string" && event.recurringEventId
+    ? event.recurringEventId
+    : null;
+  const mappingEventId = parentId || event.id;
+  const mapped = await dependencies.store.loadMappedEvent(calendar, mappingEventId);
+  if (mapped) assertMappedScope(calendar, mapped, mappingEventId);
+
+  if (parentId || event.originalStartTime) {
+    if (!mapped || !parentId) return { kind: "ignore", googleEventId: event.id, queuePolicy: "none" };
+    return {
+      kind: "read_only",
+      googleEventId: parentId,
+      familyEventId: mapped.familyEvent.id,
+      mapping: {
+        google_etag: mapped.mapping.google_etag,
+        google_updated_at: mapped.mapping.google_updated_at,
+        sync_state: "read_only",
+        safe_error_message: READ_ONLY_MESSAGES.complex_recurrence_exception,
+      },
+      conflictWinner: "unchanged",
+      expected: expectedVersions(mapped),
+      queuePolicy: "supersede_pending",
+    };
+  }
 
   if (event.status === "cancelled") {
     if (!mapped) return { kind: "ignore", googleEventId: event.id, queuePolicy: "none" };
@@ -528,6 +552,35 @@ async function changeForEvent(
       familyEventId: mapped.familyEvent.id,
       mapping: mappingObservation(event, "read_only", safeMessage),
       conflictWinner: winner,
+      expected: expectedVersions(mapped),
+      queuePolicy: "supersede_pending",
+    };
+  }
+
+  if (protectedParentIds.has(event.id)) {
+    if (!mapped) {
+      return {
+        kind: "import",
+        googleEventId: event.id,
+        familyEvent: translated.event as Record<string, unknown>,
+        mapping: {
+          google_etag: observation.etag,
+          google_updated_at: observation.updated,
+          last_google_updated_at: observation.updated,
+          sync_state: "read_only",
+          safe_error_message: READ_ONLY_MESSAGES.complex_recurrence_exception,
+        },
+        captureFamilyUpdatedAt: true,
+        expectedMappingAbsent: true,
+        queuePolicy: "none",
+      };
+    }
+    return {
+      kind: "read_only",
+      googleEventId: event.id,
+      familyEventId: mapped.familyEvent.id,
+      mapping: mappingObservation(event, "read_only", READ_ONLY_MESSAGES.complex_recurrence_exception),
+      conflictWinner: "unchanged",
       expected: expectedVersions(mapped),
       queuePolicy: "supersede_pending",
     };
@@ -590,6 +643,7 @@ async function runPull(
   let completed = false;
   const visitedPageTokens = new Set<string>();
   const pendingCancellationFamilyEventIds = new Set<string>();
+  const protectedParentIds = new Set<string>();
   let pageToken: string | undefined;
   let pages = 0;
   let processed = 0;
@@ -609,8 +663,21 @@ async function runPull(
         calendar.google_calendar_id,
         request,
       ));
+      for (const event of page.items) {
+        if (typeof event.recurringEventId === "string" && event.recurringEventId) {
+          protectedParentIds.add(event.recurringEventId);
+        }
+      }
+      const pageMasterIds = new Set(page.items
+        .filter(({ recurringEventId }) => !recurringEventId)
+        .map(({ id }) => id));
       const changes: PullChange[] = [];
-      for (const event of page.items) changes.push(await changeForEvent(calendar, dependencies, event));
+      for (const event of page.items) {
+        if (typeof event.recurringEventId === "string" && pageMasterIds.has(event.recurringEventId)) {
+          continue;
+        }
+        changes.push(await changeForEvent(calendar, dependencies, event, protectedParentIds));
+      }
       for (const change of changes) {
         if (change.kind === "cancel" && change.finalizeAfterPull) {
           pendingCancellationFamilyEventIds.add(change.familyEventId);
@@ -619,7 +686,9 @@ async function runPull(
       await dependencies.store.applyPage(calendar, changes, {
         run,
         scan,
-        seenGoogleEventIds: page.items.map(({ id }) => id),
+        seenGoogleEventIds: [...new Set(page.items.flatMap(({ id, recurringEventId }) =>
+          typeof recurringEventId === "string" && recurringEventId ? [id, recurringEventId] : [id]
+        ))],
       });
       pages += 1;
       processed += page.items.length;

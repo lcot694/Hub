@@ -73,13 +73,36 @@ test("all-day Family Hub payloads use an exclusive next date without changing th
 
 test("simple Google recurrence is translated to Family Hub fields", () => {
   const result = googleToFamilyEvent({
-    id:"g3", summary:"Bills", start:{ date:"2026-01-31" }, end:{ date:"2026-02-01" },
+    id:"g3", summary:"Bills", start:{ date:"2026-01-28" }, end:{ date:"2026-01-29" },
     recurrence:["RRULE:FREQ=MONTHLY;INTERVAL=1;UNTIL=20261231"]
   }, context);
 
   assert.equal(result.supported, true);
   assert.equal(result.event.recurrence, "monthly");
   assert.equal(result.event.recurrence_end, "2026-12-31");
+});
+
+test("Google recurrence that cannot preserve Family Hub clamping is read-only", () => {
+  const monthly = googleToFamilyEvent({
+    id:"g3-month-end", summary:"Month end", start:{ date:"2026-01-31" }, end:{ date:"2026-02-01" },
+    recurrence:["RRULE:FREQ=MONTHLY"]
+  }, context);
+  const leapYearly = googleToFamilyEvent({
+    id:"g3-leap", summary:"Leap day", start:{ date:"2024-02-29" }, end:{ date:"2024-03-01" },
+    recurrence:["RRULE:FREQ=YEARLY"]
+  }, context);
+
+  assert.deepEqual(monthly, { supported:false, readOnlyReason:"recurrence_occurrence_mismatch" });
+  assert.deepEqual(leapYearly, { supported:false, readOnlyReason:"recurrence_occurrence_mismatch" });
+});
+
+test("Family recurrence that cannot be represented by a Google RRULE stays local", () => {
+  assert.throws(() => familyToGoogleEvent({
+    title:"Month end", event_date:"2026-01-31", all_day:true, recurrence:"monthly", recurrence_end:null
+  }, context), /cannot preserve Family Hub recurrence occurrences/);
+  assert.throws(() => familyToGoogleEvent({
+    title:"Leap day", event_date:"2024-02-29", all_day:true, recurrence:"yearly", recurrence_end:null
+  }, context), /cannot preserve Family Hub recurrence occurrences/);
 });
 
 test("complex recurrence exceptions are read-only", () => {
