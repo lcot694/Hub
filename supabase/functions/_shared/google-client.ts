@@ -15,6 +15,9 @@ export interface GoogleConnection {
   access_token_encrypted: string;
   refresh_token_encrypted: string | null;
   token_expires_at: string | null;
+  google_account_id: string;
+  oauth_generation: number;
+  connection_state: "active" | "reconnect_required" | "disconnected";
 }
 
 export interface PersistedTokens {
@@ -37,7 +40,7 @@ export interface GoogleClientDependencies {
   persistTokens?: (owner: GoogleConnectionOwner, tokens: PersistedTokens) => Promise<void>;
 }
 
-export type GoogleConnectionOwner = Pick<GoogleConnection, "id" | "user_id">;
+export type GoogleConnectionOwner = Pick<GoogleConnection, "id" | "user_id" | "google_account_id" | "oauth_generation" | "connection_state">;
 
 interface TokenPersistenceResult {
   data: Array<{ id: string }> | null;
@@ -46,12 +49,13 @@ interface TokenPersistenceResult {
 
 interface TokenPersistenceQuery {
   update(values: PersistedTokens): TokenPersistenceQuery;
-  eq(column: string, value: string): TokenPersistenceQuery;
+  eq(column: string, value: string | number): TokenPersistenceQuery;
   select(columns: string): PromiseLike<TokenPersistenceResult>;
 }
 
 export interface TokenPersistenceDatabase {
-  from(table: string): TokenPersistenceQuery;
+  from?(table: string): TokenPersistenceQuery;
+  rpc?(name: string, parameters: Record<string, unknown>): Promise<{ data: unknown; error: unknown }>;
 }
 
 interface GoogleTokenResponse {
@@ -116,15 +120,31 @@ export async function persistConnectionTokens(
   tokens: PersistedTokens,
   database: TokenPersistenceDatabase = createServiceClient() as unknown as TokenPersistenceDatabase,
 ): Promise<void> {
-  if (!owner.id || !owner.user_id) {
+  if (!owner.id || !owner.user_id || !owner.google_account_id || !Number.isInteger(owner.oauth_generation) || owner.connection_state !== "active") {
     throw new GoogleApiError("transient", 503, "Google credential update failed");
   }
 
-  const { data, error } = await database
-    .from("google_connections")
+  if (database.rpc) {
+    const { data, error } = await database.rpc("persist_google_refreshed_tokens", {
+      p_connection_id: owner.id,
+      p_user_id: owner.user_id,
+      p_google_account_id: owner.google_account_id,
+      p_oauth_generation: owner.oauth_generation,
+      p_access_token_encrypted: tokens.access_token_encrypted,
+      p_refresh_token_encrypted: tokens.refresh_token_encrypted,
+      p_token_expires_at: tokens.token_expires_at,
+    });
+    if (error || data !== true) throw new GoogleApiError("transient", 503, "Google credential update failed");
+    return;
+  }
+  if (!database.from) throw new GoogleApiError("transient", 503, "Google credential update failed");
+  const { data, error } = await database.from("google_connections")
     .update(tokens)
     .eq("id", owner.id)
     .eq("user_id", owner.user_id)
+    .eq("google_account_id", owner.google_account_id)
+    .eq("oauth_generation", owner.oauth_generation)
+    .eq("connection_state", "active")
     .select("id");
   if (
     error ||
@@ -247,7 +267,13 @@ export async function googleFetch(
     };
 
     try {
-      await saveTokens({ id: connection.id, user_id: connection.user_id }, tokens);
+      await saveTokens({
+        id: connection.id,
+        user_id: connection.user_id,
+        google_account_id: connection.google_account_id,
+        oauth_generation: connection.oauth_generation,
+        connection_state: connection.connection_state,
+      }, tokens);
     } catch {
       throw new GoogleApiError("transient", 503, "Google credential update failed");
     }

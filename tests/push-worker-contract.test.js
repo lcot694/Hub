@@ -56,6 +56,8 @@ function context(overrides = {}) {
       recurrence: "none",
       recurrence_end: null,
       updated_at: "2026-08-27T13:00:00.000Z",
+      google_sync_updated_at: "2026-08-27T13:00:00.000Z",
+      google_sync_version: 7,
       sync_deleted_at: null,
     },
     mapping: {
@@ -67,12 +69,16 @@ function context(overrides = {}) {
       google_etag: '"etag-before"',
       last_family_updated_at: "2026-08-26T10:00:00.000Z",
       last_google_updated_at: "2026-08-26T10:00:00.000Z",
+      updated_at: "2026-08-27T13:30:00.000Z",
+      sync_state: "syncing",
     },
     connection: {
       id: "connection-1",
       user_id: "owner-1",
       household_id: "household-1",
       connection_state: "active",
+      google_account_id: "google-account-1",
+      oauth_generation: 4,
     },
     calendar: {
       id: "calendar-row-1",
@@ -168,6 +174,8 @@ test("create uses the UUID-derived stable Google ID and records confirmation ato
     end: { dateTime: "2026-09-02T19:00:00", timeZone: "America/Toronto" },
   });
   assert.deepEqual(call(deps, "complete"), ["complete", "job-1", "claim-1", {
+    expectedEventVersion: 7,
+    expectedMappingUpdatedAt: "2026-08-27T13:30:00.000Z",
     finalizeLocalDelete: false,
     mapping: {
       google_event_id: STABLE_GOOGLE_ID,
@@ -190,6 +198,14 @@ test("update sends the stored ETag in If-Match and updates observed timestamps",
   assert.deepEqual(call(deps, "update")[6], { ifMatch: '"etag-before"' });
   assert.equal(call(deps, "complete")[3].mapping.last_family_updated_at, "2026-08-27T13:00:00.000Z");
   assert.equal(call(deps, "complete")[3].mapping.last_google_updated_at, "2026-08-27T14:00:01.000Z");
+});
+
+test("completion carries the event revision and mapping version observed before the Google request", async () => {
+  const { processPushJob } = await pushWorker;
+  const deps = fakeDeps();
+  await processPushJob(job("update"), deps);
+  assert.equal(call(deps, "complete")[3].expectedEventVersion, 7);
+  assert.equal(call(deps, "complete")[3].expectedMappingUpdatedAt, "2026-08-27T13:30:00.000Z");
 });
 
 test("a conditional update clears Google recurrence before completing its mapping", async () => {
@@ -423,7 +439,9 @@ test("a newer cancelled event after 412 finalizes local deletion instead of reco
     finalizeLocalDelete: true,
     conflictWinner: "google",
   });
-  assert.deepEqual(call(deps, "complete"), ["complete", "job-1", "claim-1", { finalizeLocalDelete: true }]);
+  assert.deepEqual(call(deps, "complete"), ["complete", "job-1", "claim-1", {
+    expectedEventVersion: 7, expectedMappingUpdatedAt: "2026-08-27T13:30:00.000Z", finalizeLocalDelete: true,
+  }]);
 });
 
 test("a Family-newer conflict with a cancelled Google event retries without resurrection", async () => {
@@ -458,7 +476,7 @@ test("a Family-newer conflict with a cancelled Google event retries without resu
 
 test("a sparse cancelled resource deletes an unchanged local event", async () => {
   const { GooglePushError, processPushJob } = await pushWorker;
-  const unchanged = context({ familyEvent: { updated_at: "2026-08-26T10:00:00.000Z" } });
+  const unchanged = context({ familyEvent: { updated_at: "2026-08-26T10:00:00.000Z", google_sync_updated_at: "2026-08-26T10:00:00.000Z" } });
   const deps = fakeDeps({ context: unchanged, google: {
     update: async () => { throw new GooglePushError("validation", 412); },
     get: async () => ({ id: STABLE_GOOGLE_ID, status: "cancelled" }),
@@ -485,8 +503,34 @@ test("delete accepts 204, 404, and a cancelled event and finalizes locally", asy
     const deps = fakeDeps({ google: { delete: response } });
     const result = await processPushJob(job("delete"), deps);
     assert.deepEqual(result, { status: "complete", finalizeLocalDelete: true });
-    assert.deepEqual(call(deps, "complete"), ["complete", "job-1", "claim-1", { finalizeLocalDelete: true }]);
+    assert.deepEqual(call(deps, "complete"), ["complete", "job-1", "claim-1", {
+      expectedEventVersion: 7, expectedMappingUpdatedAt: "2026-08-27T13:30:00.000Z", finalizeLocalDelete: true,
+    }]);
   }
+});
+
+test("delete uses If-Match and treats Google's documented 410 as already deleted", async () => {
+  const { GooglePushError, processPushJob } = await pushWorker;
+  const deps = fakeDeps({ google: { delete: async (...args) => {
+    deps.calls.push(["delete", ...args]);
+    throw new GooglePushError("permanent", 410);
+  } } });
+  const result = await processPushJob(job("delete"), deps);
+  assert.equal(result.status, "complete");
+  assert.deepEqual(call(deps, "delete")[5], { ifMatch: '"etag-before"' });
+});
+
+test("a 412 delete preserves a newer remote edit by reconciling instead of deleting", async () => {
+  const { GooglePushError, processPushJob } = await pushWorker;
+  const remote = googleEvent({ summary: "New remote title", updated: "2026-08-27T15:00:00.000Z", etag: '"newer"' });
+  const deps = fakeDeps({ google: {
+    delete: async (...args) => { deps.calls.push(["delete", ...args]); throw new GooglePushError("validation", 412); },
+    get: async (...args) => { deps.calls.push(["get", ...args]); return remote; },
+  } });
+  const result = await processPushJob(job("delete"), deps);
+  assert.equal(result.conflictWinner, "google");
+  assert.equal(result.finalizeLocalDelete, false);
+  assert.equal(call(deps, "complete")[3].reconcileFamilyEvent.title, "New remote title");
 });
 
 test("attempted create-delete derives the stable ID when no mapped Google ID was confirmed", async () => {
@@ -584,7 +628,9 @@ test("ambiguous create replay never marks a cancelled fetched event as synced", 
     finalizeLocalDelete: true,
     conflictWinner: "google",
   });
-  assert.deepEqual(call(deps, "complete"), ["complete", "job-1", "claim-1", { finalizeLocalDelete: true }]);
+  assert.deepEqual(call(deps, "complete"), ["complete", "job-1", "claim-1", {
+    expectedEventVersion: 7, expectedMappingUpdatedAt: "2026-08-27T13:30:00.000Z", finalizeLocalDelete: true,
+  }]);
 });
 
 test("read-only or cross-owner destinations fail safely before a Google write", async () => {
@@ -670,7 +716,9 @@ test("the real Google adapter refreshes a 401 once and feeds its retry into work
   assert.equal(calendarRequests[1].headers.get("Authorization"), "Bearer rotated-access");
   assert.equal(calendarRequests[1].headers.get("If-Match"), '"etag-before"');
   assert.equal(calendarRequests[1].method, "PATCH");
-  assert.deepEqual(persisted.owner, { id: "connection-1", user_id: "owner-1" });
+  assert.deepEqual(persisted.owner, {
+    id: "connection-1", user_id: "owner-1", google_account_id: "google-account-1", oauth_generation: 4, connection_state: "active",
+  });
   assert.equal(await decryptToken(persisted.tokens.access_token_encrypted, TEST_KEY), "rotated-access");
   assert.equal(call(deps, "reconnect"), undefined);
 });

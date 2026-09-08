@@ -103,14 +103,22 @@ function exactAppOrigin(env: (name: string) => string): string {
   return configured;
 }
 
-function appRedirect(appOrigin: string, code?: SanitizedErrorCode): Response {
+function validatedReturnPath(env: (name: string) => string): string {
+  const candidate = env("APP_RETURN_PATH") || "/";
+  if (!candidate.startsWith("/") || candidate.startsWith("//") || candidate.includes("?") || candidate.includes("#") || candidate.includes("\\")) {
+    throw new Error("APP_RETURN_PATH must be an absolute application path");
+  }
+  return candidate.endsWith("/") ? candidate : `${candidate}/`;
+}
+
+function appRedirect(appOrigin: string, returnPath: string, code?: SanitizedErrorCode): Response {
   const suffix = code === undefined
-    ? "/?google=connected"
-    : `/?google=error&code=${SANITIZED_ERROR_CODES.has(code) ? code : "connection_failed"}`;
+    ? "?google=connected"
+    : `?google=error&code=${SANITIZED_ERROR_CODES.has(code) ? code : "connection_failed"}`;
   return new Response(null, {
     status: 303,
     headers: {
-      Location: `${appOrigin}${suffix}`,
+      Location: `${appOrigin}${returnPath}${suffix}`,
       "Cache-Control": "no-store",
       "Referrer-Policy": "no-referrer",
     },
@@ -316,7 +324,8 @@ export async function handleOAuthCallback(
 ): Promise<Response> {
   const env = dependencies.env ?? requiredServerEnv;
   const appOrigin = exactAppOrigin(env);
-  if (req.method !== "GET") return appRedirect(appOrigin, "invalid_request");
+  const returnPath = validatedReturnPath(env);
+  if (req.method !== "GET") return appRedirect(appOrigin, returnPath, "invalid_request");
 
   try {
     const requestUrl = new URL(req.url);
@@ -342,10 +351,10 @@ export async function handleOAuthCallback(
     const tokens = await exchangeCode(code, context.pkceVerifier, fetchImplementation, env);
     const userinfo = await loadGoogleUser(tokens.access_token, fetchImplementation);
     await saveConnection(database, flow, context, tokens, userinfo, now, env, encrypt);
-    return appRedirect(appOrigin);
+    return appRedirect(appOrigin, returnPath);
   } catch (error) {
     const code = error instanceof OAuthCallbackError ? error.code : "connection_failed";
-    return appRedirect(appOrigin, code);
+    return appRedirect(appOrigin, returnPath, code);
   }
 }
 

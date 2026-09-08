@@ -118,4 +118,8 @@ test("app uses status RPC, atomic Google writes, pending deletion RPC, and local
   assert.match(source, /googleSettings\.requestSync\("manual"\)/);
   assert.match(source, /google_event_sync_status/);
   assert.doesNotMatch(source, /eventSyncStatus[^\n]*innerHTML/);
+  assert.match(source, /rpc\("retry_google_event_sync",\{p_family_event_id:/);
+  assert.match(source, /pending_deletion/);
+  const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
+  assert.match(html, /id="googlePendingDeletions"[^>]*aria-live="polite"/);
 });

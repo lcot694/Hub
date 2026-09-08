@@ -25,13 +25,14 @@ Never place a service-role key, Google credential, OAuth token, encryption key,
 cron credential, or Vault value in config.js or any hosted browser file.
 
 SERVER SECRETS
-Configure all eight as Supabase Edge Function secrets. Enter deployment values
+Configure all eight required values and the optional return-path setting as Supabase Edge Function secrets. Enter deployment values
 in the Supabase dashboard or CLI; do not commit or paste their values into docs.
 - GOOGLE_CLIENT_ID
 - GOOGLE_CLIENT_SECRET
 - GOOGLE_OAUTH_REDIRECT_URI
 - GOOGLE_TOKEN_ENCRYPTION_KEY (base64 encoding of exactly 32 random bytes)
 - APP_ORIGIN (the exact HTTPS app origin)
+- APP_RETURN_PATH (optional hosted app path, for example /Hub/; defaults to /)
 - SUPABASE_URL
 - SUPABASE_SERVICE_ROLE_KEY
 - SYNC_CRON_SECRET (a high-entropy bearer credential)
@@ -52,10 +53,11 @@ order:
 8. 202608270007_google_disconnect_race_hardening.sql
 9. 202608270008_google_oauth_generation_serialization.sql
 10. 202608270009_google_oauth_consumption_and_reconnect.sql
+11. 202609080001_google_sync_final_hardening.sql
 
 EXISTING V2 UPGRADE
 Do not reapply schema.sql: the baseline already exists. Back up the database,
-then apply the same ten migration files above in exact filename order. Before
+then apply the same eleven migration files above in exact filename order. Before
 the hardening migration, inspect google_connections for duplicate user_id
 values. That migration stops with google_connection_duplicate_users instead of
 choosing which account and dependent rows to remove. Review and explicitly

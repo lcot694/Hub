@@ -36,6 +36,8 @@ export interface FamilyPushEvent {
   recurrence: string;
   recurrence_end: string | null;
   updated_at: string;
+  google_sync_updated_at: string;
+  google_sync_version: number;
   sync_deleted_at: string | null;
 }
 
@@ -48,6 +50,8 @@ export interface PushMapping {
   google_etag: string | null;
   last_family_updated_at: string | null;
   last_google_updated_at: string | null;
+  updated_at: string;
+  sync_state: "synced" | "syncing" | "needs_attention" | "read_only";
 }
 
 export interface PushConnection {
@@ -90,6 +94,8 @@ export interface GoogleDeleteResponse {
 }
 
 export interface PushCompletion {
+  expectedEventVersion: number;
+  expectedMappingUpdatedAt: string;
   finalizeLocalDelete: boolean;
   mapping?: {
     google_event_id: string;
@@ -157,6 +163,7 @@ export interface PushGoogleAdapter {
     calendar: PushCalendar,
     googleCalendarId: string,
     googleEventId: string,
+    options: { ifMatch: string },
   ): Promise<GoogleDeleteResponse>;
 }
 
@@ -206,9 +213,10 @@ export function createGooglePushAdapter(
         new Request(googleEventUrl(googleCalendarId, googleEventId)),
       ));
     },
-    async delete(connection, _calendar, googleCalendarId, googleEventId) {
+    async delete(connection, _calendar, googleCalendarId, googleEventId, options) {
       const response = await request(connection, new Request(googleEventUrl(googleCalendarId, googleEventId), {
         method: "DELETE",
+        headers: { "If-Match": options.ifMatch },
       }));
       if (response.status === 204) return { status: 204 };
       return { status: response.status, event: await readGoogleEvent(response) };
@@ -297,10 +305,14 @@ function assertScopedWritableContext(job: ClaimedPushJob, context: PushContext):
     connection.connection_state !== "active" ||
     !calendar.enabled ||
     !calendar.is_writable ||
-    !calendar.google_calendar_id
+    !calendar.google_calendar_id || mapping.sync_state === "read_only"
   ) {
     throw new GooglePushError("permission", 403);
   }
+}
+
+function conflictFamilyEvent(event: FamilyPushEvent): FamilyPushEvent {
+  return { ...event, updated_at: event.google_sync_updated_at || event.updated_at };
 }
 
 function assertConfirmedEvent(event: GooglePushEvent, expectedId: string): GooglePushEvent {
@@ -390,9 +402,9 @@ async function resolveFetchedEvent(
   if (fetched.status === "cancelled") {
     let conflictWinner: PushResult["conflictWinner"];
     if (typeof fetched.updated === "string" && !Number.isNaN(Date.parse(fetched.updated))) {
-      conflictWinner = chooseConflictWinner(context.mapping, context.familyEvent, fetched);
+      conflictWinner = chooseConflictWinner(context.mapping, conflictFamilyEvent(context.familyEvent), fetched);
     } else {
-      const localState = chooseConflictWinner(context.mapping, context.familyEvent, {
+      const localState = chooseConflictWinner(context.mapping, conflictFamilyEvent(context.familyEvent), {
         updated: context.mapping.last_google_updated_at,
       });
       if (localState !== "unchanged") throw new GooglePushError("transient", 409);
@@ -403,7 +415,7 @@ async function resolveFetchedEvent(
   }
 
   const confirmed = assertConfirmedEvent(fetched, eventId);
-  const conflictWinner = chooseConflictWinner(context.mapping, context.familyEvent, confirmed);
+  const conflictWinner = chooseConflictWinner(context.mapping, conflictFamilyEvent(context.familyEvent), confirmed);
   if (conflictWinner === "family") {
     const event = await updateAfterConflict(context, dependencies, eventId, payload, confirmed.etag);
     return { event, conflictWinner, finalizeLocalDelete: false };
@@ -433,7 +445,7 @@ function mappingConfirmation(
     google_event_id: googleEvent.id,
     google_etag: googleEvent.etag,
     google_updated_at: googleEvent.updated,
-    last_family_updated_at: familyEvent.updated_at,
+    last_family_updated_at: familyEvent.google_sync_updated_at || familyEvent.updated_at,
     last_google_updated_at: googleEvent.updated,
     sync_state: "synced",
     safe_error_message: null,
@@ -442,12 +454,14 @@ function mappingConfirmation(
 
 function completionForOutcome(
   familyEvent: FamilyPushEvent,
+  mapping: PushMapping,
   outcome: RemoteWriteOutcome,
 ): PushCompletion {
-  if (outcome.finalizeLocalDelete) return { finalizeLocalDelete: true };
+  const expected = { expectedEventVersion: familyEvent.google_sync_version, expectedMappingUpdatedAt: mapping.updated_at };
+  if (outcome.finalizeLocalDelete) return { ...expected, finalizeLocalDelete: true };
   if (outcome.unsupportedGoogleContent) {
     return {
-      finalizeLocalDelete: false,
+      ...expected, finalizeLocalDelete: false,
       unsupportedGoogleContent: outcome.unsupportedGoogleContent,
     };
   }
@@ -456,7 +470,7 @@ function completionForOutcome(
   const confirmedMapping = mappingConfirmation(familyEvent, outcome.event);
   const { last_family_updated_at: _staleFamilyTimestamp, ...reconciledMapping } = confirmedMapping;
   return {
-    finalizeLocalDelete: false,
+    ...expected, finalizeLocalDelete: false,
     mapping: outcome.reconcileGoogleEvent ? reconciledMapping : confirmedMapping,
     ...(outcome.reconcileGoogleEvent
       ? {
@@ -534,18 +548,37 @@ async function deleteRemoteEvent(
   context: PushContext,
   dependencies: PushDependencies,
   eventId: string,
-): Promise<void> {
+): Promise<RemoteWriteOutcome> {
+  if (!context.mapping.google_etag) throw new GooglePushError("validation", 409);
   try {
     const response = await dependencies.google.delete(
       context.connection,
       context.calendar,
       context.calendar.google_calendar_id,
       eventId,
+      { ifMatch: context.mapping.google_etag },
     );
-    if (response.status === 204 || response.status === 404 || response.event?.status === "cancelled") return;
+    if (response.status === 204 || response.status === 404 || response.status === 410 || response.event?.status === "cancelled") {
+      return { finalizeLocalDelete: true };
+    }
     throw new GooglePushError("validation", response.status || 502);
   } catch (error) {
-    if (statusOf(error) === 404) return;
+    if (statusOf(error) === 404 || statusOf(error) === 410) return { finalizeLocalDelete: true };
+    if (statusOf(error) === 412) {
+      const current = await dependencies.google.get(context.connection, context.calendar, context.calendar.google_calendar_id, eventId);
+      const confirmed = assertConfirmedEvent(current, eventId);
+      const winner = chooseConflictWinner(context.mapping, conflictFamilyEvent(context.familyEvent), confirmed);
+      if (winner === "google") {
+        const translated = translatedGoogleEvent(context, confirmed);
+        if (!translated.event) return { conflictWinner: winner, finalizeLocalDelete: false, unsupportedGoogleContent: unsupportedGoogleContent(confirmed, translated.readOnlyReason) };
+        return { event: confirmed, conflictWinner: winner, finalizeLocalDelete: false, reconcileGoogleEvent: confirmed, reconcileFamilyEvent: translated.event };
+      }
+      const retried = await dependencies.google.delete(context.connection, context.calendar, context.calendar.google_calendar_id, eventId, { ifMatch: confirmed.etag });
+      if (retried.status === 204 || retried.status === 404 || retried.status === 410 || retried.event?.status === "cancelled") {
+        return { conflictWinner: winner, finalizeLocalDelete: true };
+      }
+      throw new GooglePushError("validation", retried.status || 502);
+    }
     throw error;
   }
 }
@@ -590,8 +623,9 @@ export async function processPushJob(
     const eventId = googleIdFor(job, context.mapping);
 
     if (job.operation === "delete") {
-      await deleteRemoteEvent(context, dependencies, eventId);
-      completion = { finalizeLocalDelete: true };
+      const deleted = await deleteRemoteEvent(context, dependencies, eventId);
+      conflictWinner = deleted.conflictWinner;
+      completion = completionForOutcome(context.familyEvent, context.mapping, deleted);
     } else {
       const basePayload = familyToGoogleEvent(context.familyEvent, {
         householdId: context.familyEvent.household_id,
@@ -603,11 +637,11 @@ export async function processPushJob(
       if (job.operation === "create") {
         const created = await createRemoteEvent(job, context, dependencies, eventId, payload);
         conflictWinner = created.conflictWinner;
-        completion = completionForOutcome(context.familyEvent, created);
+        completion = completionForOutcome(context.familyEvent, context.mapping, created);
       } else {
         const updated = await updateRemoteEvent(context, dependencies, eventId, payload);
         conflictWinner = updated.conflictWinner;
-        completion = completionForOutcome(context.familyEvent, updated);
+        completion = completionForOutcome(context.familyEvent, context.mapping, updated);
       }
     }
   } catch (error) {

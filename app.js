@@ -27,6 +27,7 @@ let cursor = new Date();
 let realtimeChannel = null;
 let editingEventId = null;
 let googleStatusByEvent = new Map();
+let googleStatusRows = [];
 let loadGeneration = 0;
 const eventDialogGuard=createOperationGuard();
 
@@ -88,8 +89,27 @@ async function loadGoogleStatuses(generation){
   try{({data,error}=await supabase.rpc("get_google_sync_status",{p_household_id:household.id}))}catch(cause){error=cause}
   if(generation!==loadGeneration)return;
   googleStatusByEvent=buildEventSyncIndex(rawEvents,data,error,currentUser.id).byEvent;
+  googleStatusRows=error?[]:(data||[]);
+  renderPendingGoogleDeletions();
   if(error){console.warn("Google sync status unavailable");setSync("Calendar available · Google status unavailable",false)}
   render();
+}
+function renderPendingGoogleDeletions(){
+  const root=$("googlePendingDeletions");if(!root)return;root.replaceChildren();
+  const rows=googleStatusRows.filter(row=>row.pending_deletion&&row.mapping_owned);
+  if(!rows.length)return;
+  const heading=document.createElement("strong");heading.textContent="Pending Google deletions";root.append(heading);
+  for(const row of rows){
+    const item=document.createElement("div");item.className="google-calendar-row";
+    const text=document.createElement("span");text.textContent=row.sync_state==="needs_attention"
+      ? `Deletion needs attention${row.sync_error?`: ${row.sync_error}`:""}`:"Deletion pending";item.append(text);
+    if(row.sync_state==="needs_attention"){
+      const retry=document.createElement("button");retry.type="button";retry.className="btn";retry.textContent="Retry deletion";
+      retry.onclick=async()=>{retry.disabled=true;try{await supabase.rpc("retry_google_event_sync",{p_family_event_id:row.family_event_id});await googleSettings.requestSync("manual");}finally{retry.disabled=false}};
+      item.append(retry);
+    }
+    root.append(item);
+  }
 }
 function subscribeRealtime(){
   if(realtimeChannel) supabase.removeChannel(realtimeChannel);

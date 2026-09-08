@@ -33,6 +33,9 @@ async function connection(overrides = {}) {
     access_token_encrypted: await encryptToken("old-access", TEST_KEY),
     refresh_token_encrypted: await encryptToken("old-refresh", TEST_KEY),
     token_expires_at: "2099-01-01T00:00:00.000Z",
+    google_account_id: "google-account-1",
+    oauth_generation: 4,
+    connection_state: "active",
     ...overrides,
   };
 }
@@ -210,7 +213,7 @@ test("credential persistence filters by connection and owner and requires one up
   const fake = fakeTokenDatabase([{ id: "connection-1" }]);
 
   await persistConnectionTokens(
-    { id: "connection-1", user_id: "owner-1" },
+    { id: "connection-1", user_id: "owner-1", google_account_id: "google-account-1", oauth_generation: 4, connection_state: "active" },
     tokens,
     fake.database,
   );
@@ -220,6 +223,9 @@ test("credential persistence filters by connection and owner and requires one up
     ["update", tokens],
     ["eq", "id", "connection-1"],
     ["eq", "user_id", "owner-1"],
+    ["eq", "google_account_id", "google-account-1"],
+    ["eq", "oauth_generation", 4],
+    ["eq", "connection_state", "active"],
     ["select", "id"],
   ]);
 });
@@ -231,7 +237,7 @@ test("credential persistence safely rejects a zero-row owner-scoped update", asy
 
   await assert.rejects(
     persistConnectionTokens(
-      { id: "connection-1", user_id: "wrong-owner" },
+      { id: "connection-1", user_id: "wrong-owner", google_account_id: "google-account-1", oauth_generation: 4, connection_state: "active" },
       {
         access_token_encrypted: "encrypted-access",
         refresh_token_encrypted: "encrypted-refresh",
@@ -247,6 +253,34 @@ test("credential persistence safely rejects a zero-row owner-scoped update", asy
       !error.message.includes("wrong-owner")
     ),
   );
+});
+
+test("credential persistence fences a refresh by account generation and active state", async () => {
+  const { persistConnectionTokens } = await googleClient;
+  const fake = fakeTokenDatabase([{ id: "connection-1" }]);
+  await persistConnectionTokens(
+    { id: "connection-1", user_id: "owner-1", google_account_id: "google-account-1", oauth_generation: 4, connection_state: "active" },
+    { access_token_encrypted: "a", refresh_token_encrypted: "r", token_expires_at: "2026-08-27T12:00:00.000Z" },
+    fake.database,
+  );
+  assert.deepEqual(fake.calls.filter(([name]) => name === "eq").slice(-3), [
+    ["eq", "google_account_id", "google-account-1"],
+    ["eq", "oauth_generation", 4],
+    ["eq", "connection_state", "active"],
+  ]);
+});
+
+test("production credential persistence uses the atomic generation-fenced RPC when available", async () => {
+  const { persistConnectionTokens } = await googleClient;
+  const calls = [];
+  await persistConnectionTokens(
+    { id: "connection-1", user_id: "owner-1", google_account_id: "google-account-1", oauth_generation: 4, connection_state: "active" },
+    { access_token_encrypted: "a", refresh_token_encrypted: "r", token_expires_at: "2026-08-27T12:00:00.000Z" },
+    { rpc: async (...args) => { calls.push(args); return { data: true, error: null }; } },
+  );
+  assert.equal(calls[0][0], "persist_google_refreshed_tokens");
+  assert.equal(calls[0][1].p_oauth_generation, 4);
+  assert.equal(calls[0][1].p_google_account_id, "google-account-1");
 });
 
 test("a 401 refreshes once, persists rotated tokens for the owner, and retries once", async () => {
@@ -284,7 +318,9 @@ test("a 401 refreshes once, persists rotated tokens for the owner, and retries o
   assert.equal(calendarRequests[0].input.headers.get("Authorization"), "Bearer old-access");
   assert.equal(calendarRequests[1].input.headers.get("Authorization"), "Bearer rotated-access");
   assert.equal(calendarRequests.every(({ input }) => input.redirect === "error"), true);
-  assert.deepEqual(persisted.owner, { id: "connection-1", user_id: "owner-1" });
+  assert.deepEqual(persisted.owner, {
+    id: "connection-1", user_id: "owner-1", google_account_id: "google-account-1", oauth_generation: 4, connection_state: "active",
+  });
   assert.equal(await decryptToken(persisted.tokens.access_token_encrypted, TEST_KEY), "rotated-access");
   assert.equal(await decryptToken(persisted.tokens.refresh_token_encrypted, TEST_KEY), "rotated-refresh");
 });

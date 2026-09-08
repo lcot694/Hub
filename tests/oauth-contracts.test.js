@@ -32,6 +32,14 @@ const NOW = new Date("2026-08-27T12:00:00.000Z");
 const APP_ORIGIN = "https://family.example";
 const REDIRECT_URI = "https://project.supabase.co/functions/v1/google-oauth-callback";
 
+test("OAuth callback supports a validated configured application subpath", async () => {
+  const { handleOAuthCallback } = await oauthCallback;
+  const response = await handleOAuthCallback(new Request("https://project.test/callback", { method: "POST" }), {
+    env: (name) => name === "APP_RETURN_PATH" ? "/Family-Hub/" : testEnv(name),
+  });
+  assert.equal(response.headers.get("Location"), `${APP_ORIGIN}/Family-Hub/?google=error&code=invalid_request`);
+});
+
 function testEnv(name) {
   return {
     APP_ORIGIN,
