@@ -737,3 +737,15 @@ test("OAuth callback redirects only to fixed app paths with sanitized error code
   assert.doesNotMatch(callback, /searchParams\.set\(\s*["'](?:access_token|refresh_token|token|jwt)["']/i);
   assert.doesNotMatch(callback, /new URL\(\s*flow\.redirect_path|Location[^\n]*redirect_path/);
 });
+
+test("OAuth callback redirects prevent caching and referrer leakage", async () => {
+  const { handleOAuthCallback } = await oauthCallback;
+  const response = await handleOAuthCallback(
+    callbackRequest("?state=missing"),
+    callbackDependencies(callbackDatabase({ flowRows: [] }), googleFetch().implementation),
+  );
+
+  assert.equal(response.status, 303);
+  assert.equal(response.headers.get("Cache-Control"), "no-store");
+  assert.equal(response.headers.get("Referrer-Policy"), "no-referrer");
+});

@@ -107,7 +107,14 @@ function appRedirect(appOrigin: string, code?: SanitizedErrorCode): Response {
   const suffix = code === undefined
     ? "/?google=connected"
     : `/?google=error&code=${SANITIZED_ERROR_CODES.has(code) ? code : "connection_failed"}`;
-  return Response.redirect(`${appOrigin}${suffix}`, 303);
+  return new Response(null, {
+    status: 303,
+    headers: {
+      Location: `${appOrigin}${suffix}`,
+      "Cache-Control": "no-store",
+      "Referrer-Policy": "no-referrer",
+    },
+  });
 }
 
 function parseFlowContext(serialized: string): FlowContext {
