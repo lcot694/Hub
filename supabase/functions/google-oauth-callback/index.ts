@@ -137,13 +137,10 @@ async function consumeFlow(
 ): Promise<{ flow: ConsumedFlow; context: FlowContext }> {
   const stateHash = await sha256(state);
   const consumedAt = now.toISOString();
-  const { data, error } = await database
-    .from("google_oauth_flows")
-    .update({ consumed_at: consumedAt })
-    .eq("state_hash", stateHash)
-    .is("consumed_at", null)
-    .gt("expires_at", consumedAt)
-    .select("user_id,household_id,connection_generation,redirect_path");
+  const { data, error } = await database.rpc("consume_google_oauth_flow", {
+    p_state_hash: stateHash,
+    p_consumed_at: consumedAt,
+  });
 
   if (error || !Array.isArray(data) || data.length !== 1) {
     throw new OAuthCallbackError("invalid_state");

@@ -118,12 +118,22 @@ function callbackDatabase({
     writes,
     rpc(name, args) {
       calls.push(["rpc", name, args]);
+      if (name === "consume_google_oauth_flow") {
+        return Promise.resolve({ data: flowRows, error: null });
+      }
       if (name === "is_current_google_oauth_generation") {
         const current = existing ? existing.oauth_generation === args.p_connection_generation : true;
         return Promise.resolve({ data: current, error: null });
       }
       if (name === "persist_google_oauth_connection") {
         if (connectionUpdateRows?.length === 0) return Promise.resolve({ data: "invalid_state", error: null });
+        if (existing?.connection_state === "disconnected") {
+          if (!args.p_refresh_token_encrypted) {
+            return Promise.resolve({ data: "refresh_token_required", error: null });
+          }
+          writes.push({ operation: "update", values: args });
+          return Promise.resolve({ data: "ok", error: null });
+        }
         if (existing && (existing.household_id !== args.p_household_id || existing.person_id !== args.p_person_id)) {
           return Promise.resolve({ data: "context_mismatch", error: null });
         }
@@ -431,6 +441,46 @@ test("OAuth reconnect preserves the encrypted refresh token when Google omits ro
   assert.equal(database.writes[0].values.p_connection_generation, 4);
 });
 
+test("a disconnected row can reconnect to a newly authorized context and Google account", async () => {
+  const { handleOAuthCallback } = await oauthCallback;
+  const database = callbackDatabase({
+    existing: {
+      id: "connection-1", user_id: USER_ID, household_id: HOUSEHOLD_ID, person_id: PERSON_ID,
+      google_account_id: "old-google-account", refresh_token_encrypted: null,
+      connection_state: "disconnected", oauth_generation: 9,
+    },
+    flowRows: [{
+      user_id: USER_ID, household_id: OTHER_HOUSEHOLD_ID, connection_generation: 9,
+      redirect_path: JSON.stringify({ version: 1, personId: OTHER_PERSON_ID, pkceVerifier: "v".repeat(43) }),
+    }],
+  });
+  const google = googleFetch({ accountId: "new-google-account", refreshToken: "new-refresh" });
+
+  const response = await handleOAuthCallback(callbackRequest(), callbackDependencies(database, google.implementation));
+
+  assert.equal(response.headers.get("Location"), `${APP_ORIGIN}/?google=connected`);
+  assert.equal(database.writes.length, 1);
+  assert.equal(database.writes[0].values.p_household_id, OTHER_HOUSEHOLD_ID);
+  assert.equal(database.writes[0].values.p_person_id, OTHER_PERSON_ID);
+  assert.equal(database.writes[0].values.p_google_account_id, "new-google-account");
+  assert.equal(database.writes[0].values.p_refresh_token_encrypted, "encrypted:new-refresh");
+});
+
+test("a disconnected row rejects reconnection when Google omits a fresh refresh token", async () => {
+  const { handleOAuthCallback } = await oauthCallback;
+  const database = callbackDatabase({ existing: {
+    id: "connection-1", user_id: USER_ID, household_id: HOUSEHOLD_ID, person_id: PERSON_ID,
+    google_account_id: "old-google-account", refresh_token_encrypted: null,
+    connection_state: "disconnected", oauth_generation: 0,
+  } });
+  const google = googleFetch({ accountId: "new-google-account", includeRefreshToken: false });
+
+  const response = await handleOAuthCallback(callbackRequest(), callbackDependencies(database, google.implementation));
+
+  assert.equal(response.headers.get("Location"), `${APP_ORIGIN}/?google=error&code=refresh_token_required`);
+  assert.equal(database.writes.length, 0);
+});
+
 test("a flow created before disconnect is rejected before Google access", async () => {
   const { handleOAuthCallback } = await oauthCallback;
   const database = callbackDatabase({
@@ -594,11 +644,9 @@ test("OAuth callback atomically consumes only a matching unexpired unused state"
   const callback = await source("google-oauth-callback");
 
   assert.match(callback, /stateHash\s*=\s*await sha256/);
-  assert.match(callback, /from\(\s*["']google_oauth_flows["']\s*\)/);
-  assert.match(callback, /update\(\s*\{\s*consumed_at:/);
-  assert.match(callback, /eq\(\s*["']state_hash["']\s*,\s*stateHash\s*\)/);
-  assert.match(callback, /is\(\s*["']consumed_at["']\s*,\s*null\s*\)/);
-  assert.match(callback, /gt\(\s*["']expires_at["']/);
+  assert.match(callback, /rpc\(\s*["']consume_google_oauth_flow["']/);
+  assert.match(callback, /p_state_hash:\s*stateHash/);
+  assert.match(callback, /p_consumed_at:\s*consumedAt/);
   assert.match(callback, /code_verifier["']?\s*:\s*pkceVerifier/);
 });
 
@@ -609,6 +657,59 @@ test("OAuth callback consumes valid state before handling a Google denial", asyn
   assert.ok(handlerBody.indexOf("await consumeFlow") >= 0);
   assert.ok(handlerBody.indexOf('searchParams.has("error")') >= 0);
   assert.ok(handlerBody.indexOf("await consumeFlow") < handlerBody.indexOf('searchParams.has("error")'));
+});
+
+test("OAuth callback atomically returns and scrubs only the consumed flow before success", async () => {
+  const { handleOAuthCallback } = await oauthCallback;
+  const database = callbackDatabase({ existing: {
+    id: "connection-1", user_id: USER_ID, household_id: HOUSEHOLD_ID, person_id: PERSON_ID,
+    google_account_id: "google-account", refresh_token_encrypted: "encrypted:refresh",
+  } });
+  const google = googleFetch();
+
+  const response = await handleOAuthCallback(callbackRequest(), callbackDependencies(database, google.implementation));
+
+  assert.equal(response.headers.get("Location"), `${APP_ORIGIN}/?google=connected`);
+  const consume = database.calls.find((call) => call[0] === "rpc" && call[1] === "consume_google_oauth_flow");
+  assert.ok(consume);
+  assert.notEqual(consume[2].p_state_hash, "state-1");
+});
+
+test("Google denial still atomically consumes and scrubs the exact flow without Google access", async () => {
+  const { handleOAuthCallback } = await oauthCallback;
+  const database = callbackDatabase();
+  const google = googleFetch();
+
+  const response = await handleOAuthCallback(
+    callbackRequest("?error=access_denied&state=state-1"),
+    callbackDependencies(database, google.implementation),
+  );
+
+  assert.equal(response.headers.get("Location"), `${APP_ORIGIN}/?google=error&code=authorization_denied`);
+  assert.ok(database.calls.some((call) => call[0] === "rpc" && call[1] === "consume_google_oauth_flow"));
+  assert.equal(google.requests.length, 0);
+});
+
+test("OAuth lifecycle SQL scrubs one consumed flow and allows disconnected-row repurposing only with a fresh refresh token", async () => {
+  const sql = await readFile(new URL("../supabase/migrations/202608270009_google_oauth_consumption_and_reconnect.sql", import.meta.url), "utf8");
+  assert.match(sql, /where state_hash=p_state_hash[\s\S]*consumed_at is null[\s\S]*for update/i);
+  assert.match(sql, /redirect_path='\{\}'[\s\S]*where id=v_flow\.id/i);
+  assert.match(sql, /v_existing\.connection_state = 'disconnected'[\s\S]*p_refresh_token_encrypted is null[\s\S]*return 'refresh_token_required'/i);
+  assert.match(sql, /household_id=p_household_id[\s\S]*person_id=p_person_id[\s\S]*google_account_id=p_google_account_id/i);
+  assert.match(sql, /else[\s\S]*context_mismatch[\s\S]*account_switch_requires_disconnect/i);
+  assert.match(sql, /security definer set search_path = public/i);
+  assert.match(sql, /revoke all on function public\.consume_google_oauth_flow[\s\S]*grant execute[\s\S]*to service_role/i);
+});
+
+test("consuming an older callback cannot scrub a newer active flow", async () => {
+  const sql = await readFile(new URL("../supabase/migrations/202608270009_google_oauth_consumption_and_reconnect.sql", import.meta.url), "utf8");
+  const consume = sql.slice(
+    sql.indexOf("create or replace function public.consume_google_oauth_flow"),
+    sql.indexOf("create or replace function public.persist_google_oauth_connection"),
+  );
+  assert.match(consume, /where state_hash=p_state_hash[\s\S]*for update/i);
+  assert.match(consume, /update public\.google_oauth_flows[\s\S]*where id=v_flow\.id/i);
+  assert.doesNotMatch(consume, /update public\.google_oauth_flows[\s\S]*where user_id/i);
 });
 
 test("OAuth callback encrypts credentials and persists the stable Google account identity", async () => {
