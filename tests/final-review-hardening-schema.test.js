@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
 const migrationUrl = new URL("../supabase/migrations/202609080001_google_sync_final_hardening.sql", import.meta.url);
+const reconnectFenceUrl = new URL("../supabase/migrations/202609080002_google_reconnect_failure_fence.sql", import.meta.url);
 
 async function migration() { return await readFile(migrationUrl, "utf8"); }
 
@@ -78,4 +79,22 @@ test("visible status is queue-derived and tombstoned failures have an authentica
   assert.match(sql, /public\.is_household_member/i);
   assert.match(sql, /safe_error_message/i);
   assert.doesNotMatch(status, /access_token_encrypted|refresh_token_encrypted/);
+});
+
+test("server-side mapped saves reject recurrence anchors Google cannot represent", async () => {
+  const sql = await migration();
+  const enqueue = sql.match(/create or replace function public\.enqueue_google_event_change_internal[\s\S]*?\n\$\$;/i)?.[0] ?? "";
+  assert.match(enqueue, /extract\(day from .*event_date\)\s*>\s*28/i);
+  assert.match(enqueue, /recurrence='yearly'[\s\S]*02-29/i);
+  assert.match(enqueue, /google_recurrence_not_representable/i);
+});
+
+test("stale authorization bookkeeping is generation fenced and supersedes only its leased work", async () => {
+  const sql = await readFile(reconnectFenceUrl, "utf8");
+  assert.match(sql, /mark_google_connection_reconnect\(\s*p_connection_id uuid,p_user_id uuid,p_google_account_id text,p_oauth_generation bigint\)/i);
+  assert.match(sql, /google_account_id=p_google_account_id[\s\S]*oauth_generation=p_oauth_generation[\s\S]*connection_state='active'/i);
+  assert.match(sql, /supersede_stale_google_push_job[\s\S]*claim_token=p_claim_token[\s\S]*status='processing'/i);
+  assert.match(sql, /cancel_stale_google_pull[\s\S]*updated_at=p_expected_sync_version/i);
+  assert.match(sql, /revoke all on function public\.mark_google_connection_reconnect\(uuid,uuid\)/i);
+  assert.match(sql, /set search_path = public/ig);
 });

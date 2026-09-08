@@ -455,6 +455,7 @@ $("eventForm").onsubmit=async e=>{
   };
 
   const plan=eventWritePlan(payload,$("eventCalendar").value,eventId!==null);
+  if(plan.kind==="blocked"){alert(plan.notice);setSync("Calendar available",true);return}
   const operation=eventDialogGuard.begin(saveButton);
   let result,operationCurrent=false;
   try{
@@ -472,6 +473,7 @@ $("eventForm").onsubmit=async e=>{
     setSync(editingEventId ? "Update error" : "Save error",false);
     return;
   }
+  if(plan.notice)alert(plan.notice);
 
   if(editingEventId===eventId){editingEventId=null;$("eventDialog").close();eventDialogGuard.invalidate()}
 };

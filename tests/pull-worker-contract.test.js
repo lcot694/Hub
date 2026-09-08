@@ -39,6 +39,8 @@ function calendar(overrides = {}) {
       household_id: "household-1",
       person_id: "person-default",
       connection_state: "active",
+      google_account_id: "google-account-1",
+      oauth_generation: 3,
     },
   };
   return {
@@ -334,9 +336,11 @@ function fakePullDeps(options = {}) {
       calls.push(["abort-full", selected.id, structuredClone(scan)]);
       if (activeScan?.scanId === scan.scanId && activeScan.generation === scan.generation) activeScan = null;
     },
-    async markReconnect(connectionId, ownerUserId) {
-      calls.push(["reconnect", connectionId, ownerUserId]);
+    async markReconnect(connection) {
+      calls.push(["reconnect", structuredClone(connection)]);
+      return true;
     },
+    async cancelStaleAuthorization(selected) { calls.push(["cancel-stale-auth", selected.id]); },
     async recordFailure(selected, category, safeMessage) {
       calls.push(["failure", selected.id, category, safeMessage]);
     },
@@ -421,6 +425,21 @@ test("new Google events import once with the connection's default person", async
     "events from enabled reader calendars remain visible but cannot become writable");
   assert.equal(deps.records.get("new-event").mapping.safe_error_message, "Google calendar is read-only");
   assert.deepEqual(calls(deps, "apply").map((entry) => entry[2][0].kind), ["import", "update"]);
+});
+
+test("an unmapped Google series with non-equivalent recurrence imports a safe read-only local anchor", async () => {
+  const { pullCalendar } = await pullWorker;
+  const deps = fakePullDeps({ pages: [{ items: [googleEvent("month-end", {
+    recurrence: ["RRULE:FREQ=MONTHLY"],
+    start: { date: "2026-01-31" }, end: { date: "2026-02-01" },
+  })], nextSyncToken: NEXT_SYNC_TOKEN }] });
+  await pullCalendar(calendar({ sync_token: null }), deps);
+  const record = deps.records.get("month-end");
+  assert.ok(record);
+  assert.equal(record.familyEvent.recurrence, "none");
+  assert.equal(record.familyEvent.person_id, "person-default");
+  assert.equal(record.mapping.sync_state, "read_only");
+  assert.match(record.mapping.safe_error_message, /different occurrences/i);
 });
 
 test("mapped Google updates preserve the assigned person and Family-Hub-only metadata", async () => {
@@ -680,9 +699,20 @@ test("authorization failures mark only the owned connection and expose a sanitiz
     assert.equal(error.message, "Google authorization needs reconnecting");
     return true;
   });
-  assert.deepEqual(calls(deps, "reconnect"), [["reconnect", "connection-1", "owner-1"]]);
+  assert.equal(calls(deps, "reconnect")[0][1].oauth_generation, 3);
   assert.deepEqual(calls(deps, "failure")[0].slice(2), ["authorization", "Google authorization needs reconnecting"]);
   assert.doesNotMatch(JSON.stringify(deps.calls), /refresh_token|private/i);
+});
+
+test("a stale pull authorization failure releases only its old lease without marking the reconnected row", async () => {
+  const { pullCalendar } = await pullWorker;
+  const deps = fakePullDeps({
+    pages: [Object.assign(new Error("old 401"), { category: "authorization", status: 401 })],
+    store: { markReconnect: async (connection) => { deps.calls.push(["reconnect", connection]); return false; } },
+  });
+  await assert.rejects(() => pullCalendar(calendar(), deps));
+  assert.deepEqual(calls(deps, "cancel-stale-auth"), [["cancel-stale-auth", "calendar-row-1"]]);
+  assert.equal(calls(deps, "failure").length, 0);
 });
 
 test("a concurrent Family edit fails the page CAS instead of being overwritten", async () => {

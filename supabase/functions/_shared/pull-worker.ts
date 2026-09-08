@@ -249,7 +249,8 @@ export interface PullStore {
   ): Promise<void>;
   /** Best-effort generation-scoped lease cleanup after an incomplete full scan. */
   abortFullReconciliation(calendar: PullCalendar, scan: FullReconciliationScan): Promise<void>;
-  markReconnect(connectionId: string, ownerUserId: string): Promise<void>;
+  markReconnect(connection: PullConnection): Promise<boolean>;
+  cancelStaleAuthorization(calendar: PullCalendar): Promise<void>;
   recordFailure(calendar: PullCalendar, category: PullErrorCategory, safeMessage: string): Promise<void>;
 }
 
@@ -289,7 +290,7 @@ const SAFE_MESSAGES: Record<PullErrorCategory, string> = {
 const READ_ONLY_MESSAGES: Record<string, string> = {
   complex_recurrence: "Google event has an unsupported recurrence pattern",
   complex_recurrence_exception: "Google event has an unsupported recurrence exception",
-  recurrence_occurrence_mismatch: "Google recurrence cannot preserve Family Hub month-end occurrences",
+  recurrence_occurrence_mismatch: "Google recurrence has different occurrences in Family Hub",
   recurring_time_zone_mismatch: "Google recurring event uses a different time zone",
   multi_day_event: "Google multi-day event is read-only",
   ambiguous_local_time: "Google event has an ambiguous local time",
@@ -543,6 +544,21 @@ async function changeForEvent(
     householdTimeZone: calendar.householdTimeZone,
   });
   if (!translated.supported) {
+    if (!mapped && translated.readOnlyReason === "recurrence_occurrence_mismatch") {
+      const anchor = googleToFamilyEvent({ ...event, recurrence: undefined }, {
+        householdId: calendar.connection.household_id,
+        defaultPersonId: calendar.connection.person_id,
+        householdTimeZone: calendar.householdTimeZone,
+      });
+      if (anchor.supported) return {
+        kind: "import", googleEventId: event.id,
+        familyEvent: anchor.event as Record<string, unknown>,
+        mapping: { google_etag: observation.etag, google_updated_at: observation.updated,
+          last_google_updated_at: observation.updated, sync_state: "read_only",
+          safe_error_message: READ_ONLY_MESSAGES.recurrence_occurrence_mismatch },
+        captureFamilyUpdatedAt: true, expectedMappingAbsent: true, queuePolicy: "none",
+      };
+    }
     if (!mapped) return { kind: "ignore", googleEventId: event.id, queuePolicy: "none" };
     const winner = conflictWinner(mapped, event);
     const safeMessage = READ_ONLY_MESSAGES[translated.readOnlyReason] || "Google event has unsupported content";
@@ -733,7 +749,11 @@ async function recordSanitizedFailure(
 ): Promise<void> {
   try {
     if (category === "authorization") {
-      await dependencies.store.markReconnect(calendar.connection.id, calendar.ownerUserId);
+      const current = await dependencies.store.markReconnect(calendar.connection);
+      if (!current) {
+        await dependencies.store.cancelStaleAuthorization(calendar);
+        return;
+      }
     }
     await dependencies.store.recordFailure(calendar, category, SAFE_MESSAGES[category]);
   } catch {

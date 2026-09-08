@@ -100,6 +100,19 @@ test("write plan preserves direct Family writes and routes Google writes through
   });
 });
 
+test("non-representable Google recurrence is converted to Family-only with a clear notice", () => {
+  for (const payload of [
+    { event_date: "2026-01-31", recurrence: "monthly" },
+    { event_date: "2028-02-29", recurrence: "yearly" },
+  ]) {
+    assert.deepEqual(eventWritePlan(payload, "calendar-row", false), {
+      kind: "family-insert",
+      payload,
+      notice: "This recurrence stays in Family Hub because Google Calendar would show different dates.",
+    });
+  }
+});
+
 test("event form exposes all-day, destination, monthly and yearly controls", async () => {
   const html = await readFile(new URL("../index.html", import.meta.url), "utf8");
   assert.match(html, /id="eventAllDay"/);

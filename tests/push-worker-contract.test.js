@@ -127,9 +127,11 @@ function fakeDeps(options = {}) {
     fail: async (jobId, claimToken, category, safeMessage, nextAttemptAt) => {
       calls.push(["fail", jobId, claimToken, category, safeMessage, nextAttemptAt]);
     },
-    markReconnect: async (connectionId, userId) => {
-      calls.push(["reconnect", connectionId, userId]);
+    markReconnect: async (connection) => {
+      calls.push(["reconnect", connection]);
+      return true;
     },
+    supersedeStaleAuthorization: async (...args) => { calls.push(["supersede-auth", ...args]); },
     ...options.store,
   };
   const google = {
@@ -660,9 +662,22 @@ test("authorization failure marks reconnect and stores only a sanitized categori
   const result = await processPushJob(job("update"), deps);
 
   assert.deepEqual(result, { status: "failed", finalizeLocalDelete: false, errorCategory: "authorization" });
-  assert.deepEqual(call(deps, "reconnect"), ["reconnect", "connection-1", "owner-1"]);
+  assert.deepEqual(call(deps, "reconnect"), ["reconnect", deps.store === undefined ? undefined : context().connection]);
   assert.deepEqual(call(deps, "fail"), ["fail", "job-1", "claim-1", "authorization", "Google authorization needs reconnecting", null]);
   assert.doesNotMatch(JSON.stringify(deps.calls), /access_token=private/);
+});
+
+test("a stale authorization failure supersedes its job without changing a reconnected account", async () => {
+  const { GooglePushError, processPushJob } = await pushWorker;
+  const deps = fakeDeps({
+    store: { markReconnect: async (connection) => { deps.calls.push(["reconnect", connection]); return false; } },
+    google: { update: async () => { throw new GooglePushError("authorization", 401); } },
+  });
+  const result = await processPushJob(job("update"), deps);
+  assert.equal(result.errorCategory, "authorization");
+  assert.equal(call(deps, "fail"), undefined);
+  assert.deepEqual(call(deps, "supersede-auth").slice(1), ["job-1", "claim-1"]);
+  assert.equal(call(deps, "reconnect")[1].oauth_generation, 4);
 });
 
 test("transient failures use retry policy and fence failure with the claim token", async () => {

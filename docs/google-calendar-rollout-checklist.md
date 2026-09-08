@@ -19,7 +19,7 @@ For each check, record `PASS`, `FAIL`, or `N/A`, plus a brief sanitized note.
 | Result | Check | Sanitized notes |
 |---|---|---|
 | ___ | Public `config.js` contains only the Supabase URL and publishable key. | ____________________ |
-| ___ | All eleven migrations were applied in filename order. | ____________________ |
+| ___ | All twelve migrations were applied in filename order. | ____________________ |
 | ___ | All six Edge Functions are deployed. | ____________________ |
 | ___ | Both required Vault secret names exist; no values were copied into this record. | ____________________ |
 | ___ | `family-hub-google-sync` is scheduled every five minutes and completes successfully. | ____________________ |

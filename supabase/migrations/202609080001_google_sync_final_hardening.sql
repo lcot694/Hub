@@ -68,6 +68,11 @@ begin
   select * into v_mapping from public.google_event_mappings where family_event_id=p_family_event_id for update;
   if not found then return; end if;
   perform public.assert_google_mapping_writable(p_family_event_id);
+  if p_operation<>'delete' and exists(select 1 from public.events e where e.id=p_family_event_id and
+    ((e.recurrence='monthly' and extract(day from e.event_date)>28)
+      or (e.recurrence='yearly' and to_char(e.event_date,'MM-DD')='02-29'))) then
+    raise exception using errcode='22023',message='google_recurrence_not_representable';
+  end if;
   if exists(select 1 from public.events where id=p_family_event_id and sync_deleted_at is not null) then v_operation:='delete'; end if;
   update public.google_sync_queue set status='superseded',updated_at=clock_timestamp()
     where family_event_id=p_family_event_id and status='pending';

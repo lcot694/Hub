@@ -60,9 +60,12 @@ export function createSupabasePushStore(database: RpcClient): PushStore {
         p_next_attempt_at: nextAttemptAt,
       },
     ),
-    markReconnect: (connectionId: string, ownerUserId: string) => rpc<void>(database, "mark_google_connection_reconnect", {
-      p_connection_id: connectionId,
-      p_user_id: ownerUserId,
+    markReconnect: (connection) => rpc<boolean>(database, "mark_google_connection_reconnect", {
+      p_connection_id: connection.id, p_user_id: connection.user_id,
+      p_google_account_id: connection.google_account_id, p_oauth_generation: connection.oauth_generation,
+    }),
+    supersedeStaleAuthorization: (jobId, claimToken) => rpc<void>(database, "supersede_stale_google_push_job", {
+      p_job_id: jobId, p_claim_token: claimToken,
     }),
   };
 }
@@ -99,9 +102,12 @@ export function createSupabasePullStore(database: RpcClient): PullStore {
       "abort_google_full_reconciliation",
       { p_calendar_id: calendar.id, p_scan: scan },
     ),
-    markReconnect: (connectionId: string, ownerUserId: string) => rpc<void>(database, "mark_google_connection_reconnect", {
-      p_connection_id: connectionId,
-      p_user_id: ownerUserId,
+    markReconnect: (connection) => rpc<boolean>(database, "mark_google_connection_reconnect", {
+      p_connection_id: connection.id, p_user_id: connection.user_id,
+      p_google_account_id: connection.google_account_id, p_oauth_generation: connection.oauth_generation,
+    }),
+    cancelStaleAuthorization: (calendar) => rpc<void>(database, "cancel_stale_google_pull", {
+      p_calendar_id: calendar.id, p_expected_sync_version: calendar.sync_version,
     }),
     recordFailure: (calendar: PullCalendar, category: PullErrorCategory, safeMessage: string) => rpc<void>(
       database,

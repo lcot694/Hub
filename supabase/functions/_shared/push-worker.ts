@@ -133,7 +133,8 @@ export interface PushStore {
     safeMessage: string,
     nextAttemptAt: string | null,
   ): Promise<void>;
-  markReconnect(connectionId: string, userId: string): Promise<void>;
+  markReconnect(connection: PushConnection): Promise<boolean>;
+  supersedeStaleAuthorization(jobId: string, claimToken: string): Promise<void>;
 }
 
 export interface PushGoogleAdapter {
@@ -591,7 +592,11 @@ async function recordFailure(
 ): Promise<PushResult> {
   const category = errorCategory(error);
   if (category === "authorization" && context) {
-    await dependencies.store.markReconnect(context.connection.id, context.connection.user_id);
+    const current = await dependencies.store.markReconnect(context.connection);
+    if (!current) {
+      await dependencies.store.supersedeStaleAuthorization(job.id, job.claim_token);
+      return { status: "failed", finalizeLocalDelete: false, errorCategory: category };
+    }
   }
   const now = dependencies.now?.() ?? new Date().toISOString();
   const decision = retryDecision(category, job.attempt_count, now, { jitter: dependencies.jitter });
