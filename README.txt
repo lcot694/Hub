@@ -36,8 +36,12 @@ in the Supabase dashboard or CLI; do not commit or paste their values into docs.
 - SUPABASE_SERVICE_ROLE_KEY
 - SYNC_CRON_SECRET (a high-entropy bearer credential)
 
-DATABASE MIGRATIONS
-Apply every file in supabase/migrations in this exact filename order:
+DATABASE SETUP
+
+FRESH INSTALL
+First apply schema.sql once to create the baseline Family Hub database. After
+that succeeds, apply every file in supabase/migrations in this exact filename
+order:
 1. 202608260001_google_sync_schema.sql
 2. 202608260002_google_sync_schedule.sql
 3. 202608270002_google_calendar_hardening.sql
@@ -49,10 +53,13 @@ Apply every file in supabase/migrations in this exact filename order:
 9. 202608270008_google_oauth_generation_serialization.sql
 10. 202608270009_google_oauth_consumption_and_reconnect.sql
 
-For an existing database, first inspect google_connections for duplicate user_id
-values. The hardening migration stops with google_connection_duplicate_users
-instead of choosing which account and dependent rows to remove. Review and
-explicitly disconnect the unwanted connection, then retry the migrations.
+EXISTING V2 UPGRADE
+Do not reapply schema.sql: the baseline already exists. Back up the database,
+then apply the same ten migration files above in exact filename order. Before
+the hardening migration, inspect google_connections for duplicate user_id
+values. That migration stops with google_connection_duplicate_users instead of
+choosing which account and dependent rows to remove. Review and explicitly
+disconnect the unwanted connection, then retry the remaining migrations.
 
 EDGE FUNCTIONS
 Deploy all six function directories under supabase/functions:
@@ -65,8 +72,13 @@ Deploy all six function directories under supabase/functions:
 
 The URI registered with Google and GOOGLE_OAUTH_REDIRECT_URI must both be the
 deployed google-oauth-callback URL shown above. Do not disable JWT verification
-globally: browser-facing functions authenticate the caller; the callback
-validates one-time OAuth state; the scheduled function uses its own credential.
+globally. `google-oauth-callback` and `google-sync-scheduled` are the only
+intentional JWT-verification exceptions in supabase/config.toml. The callback
+validates one-time OAuth state. The scheduler cannot present a user JWT because
+pg_cron calls it with the custom bearer held in Vault; it validates that bearer
+against SYNC_CRON_SECRET with a constant-time comparison. All other
+browser-facing functions retain platform JWT verification and authenticate the
+caller.
 
 VAULT AND FIVE-MINUTE SCHEDULE
 Create these exact Supabase Vault secrets:

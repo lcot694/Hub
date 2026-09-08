@@ -25,3 +25,14 @@ test("HTML loads the v3 application entry point", async () => {
   const source = await readFile(new URL("index.html", root), "utf8");
   assert.match(source, /<script\s+type="module"\s+src="app\.js\?v=3"><\/script>/);
 });
+
+test("service worker evicts old caches and falls back only to the current cache", async () => {
+  const source = await readFile(new URL("sw.js", root), "utf8");
+
+  assert.match(source, /caches\.keys\(\)/);
+  assert.match(source, /key\s*!==\s*CACHE/);
+  assert.match(source, /caches\.delete\(key\)/);
+  assert.match(source, /caches\.open\(CACHE\)[\s\S]*?\.match\(e\.request\)/);
+  assert.doesNotMatch(source, /catch\(\(\)\s*=>\s*caches\.match\(/);
+  assert.match(source, /self\.clients\.claim\(\)/);
+});
