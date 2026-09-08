@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 
 const migrationUrl = new URL("../supabase/migrations/202609080001_google_sync_final_hardening.sql", import.meta.url);
 const reconnectFenceUrl = new URL("../supabase/migrations/202609080002_google_reconnect_failure_fence.sql", import.meta.url);
+const staleQueueUrl = new URL("../supabase/migrations/202609080003_google_stale_authorization_queue_fix.sql", import.meta.url);
 
 async function migration() { return await readFile(migrationUrl, "utf8"); }
 
@@ -97,4 +98,15 @@ test("stale authorization bookkeeping is generation fenced and supersedes only i
   assert.match(sql, /cancel_stale_google_pull[\s\S]*updated_at=p_expected_sync_version/i);
   assert.match(sql, /revoke all on function public\.mark_google_connection_reconnect\(uuid,uuid\)/i);
   assert.match(sql, /set search_path = public/ig);
+});
+
+test("stale authorization completion retries without a successor and supersedes with one", async () => {
+  const sql = await readFile(staleQueueUrl, "utf8");
+  const routine = sql.match(/create or replace function public\.supersede_stale_google_push_job[\s\S]*?end \$\$;/i)?.[0] ?? "";
+  assert.match(routine, /case\s+when exists\s*\([\s\S]*successor[\s\S]*status in \('pending','processing'\)[\s\S]*then 'superseded'\s+else 'pending'\s+end/i);
+  assert.match(routine, /next_attempt_at\s*=\s*clock_timestamp\(\)/i);
+  assert.match(routine, /where id=p_job_id and claim_token=p_claim_token and status='processing'/i);
+  assert.match(routine, /successor\.family_event_id=google_sync_queue\.family_event_id/i);
+  assert.match(routine, /successor\.google_event_mapping_id=google_sync_queue\.google_event_mapping_id/i);
+  assert.match(routine, /claim_token=null[\s\S]*lease_expires_at=null[\s\S]*safe_error_message=null/i);
 });
