@@ -1,0 +1,205 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { familyToGoogleEvent, googleToFamilyEvent } from "../lib/google-event-model.js";
+
+const context = {
+  householdId:"h1",
+  defaultPersonId:"p1",
+  householdTimeZone:"America/Toronto"
+};
+
+test("all-day Google dates remain date-only", () => {
+  const result = googleToFamilyEvent(
+    { id:"g1", summary:"School", start:{ date:"2026-09-01" }, end:{ date:"2026-09-02" }, updated:"2026-08-26T12:00:00Z" },
+    context
+  );
+
+  assert.equal(result.supported, true);
+  assert.equal(result.event.event_date, "2026-09-01");
+  assert.equal(result.event.all_day, true);
+  assert.equal(result.event.start_time, null);
+  assert.equal(result.event.end_time, null);
+});
+
+test("timed Google events use the household zone across a daylight-saving boundary", () => {
+  const result = googleToFamilyEvent({
+    id:"g1",
+    summary:"After school",
+    start:{ dateTime:"2026-03-08T22:30:00Z" },
+    end:{ dateTime:"2026-03-08T23:30:00Z" }
+  }, context);
+
+  assert.deepEqual(result, {
+    supported:true,
+    event:{
+      household_id:"h1",
+      person_id:"p1",
+      title:"After school",
+      event_date:"2026-03-08",
+      start_time:"18:30",
+      end_time:"19:30",
+      all_day:false,
+      recurrence:"none",
+      recurrence_end:null
+    }
+  });
+});
+
+test("Family Hub metadata is absent from Google payloads", () => {
+  const payload = familyToGoogleEvent({
+    title:"Practice", event_date:"2026-09-02", start_time:"18:00", end_time:"19:00",
+    all_day:false, recurrence:"weekly", recurrence_end:"2026-12-01", person_id:"child", color:"#fff"
+  }, context);
+
+  assert.equal(payload.summary, "Practice");
+  assert.equal("person_id" in payload, false);
+  assert.equal("color" in payload, false);
+  assert.deepEqual(payload.recurrence, ["RRULE:FREQ=WEEKLY;UNTIL=20261202T045959Z"]);
+  assert.deepEqual(payload.start, { dateTime:"2026-09-02T18:00:00", timeZone:"America/Toronto" });
+  assert.deepEqual(payload.end, { dateTime:"2026-09-02T19:00:00", timeZone:"America/Toronto" });
+});
+
+test("all-day Family Hub payloads use an exclusive next date without changing the start date", () => {
+  const payload = familyToGoogleEvent({
+    title:"Holiday", event_date:"2026-12-31", all_day:true, recurrence:"none"
+  }, context);
+
+  assert.deepEqual(payload, {
+    summary:"Holiday",
+    start:{ date:"2026-12-31" },
+    end:{ date:"2027-01-01" }
+  });
+});
+
+test("simple Google recurrence is translated to Family Hub fields", () => {
+  const result = googleToFamilyEvent({
+    id:"g3", summary:"Bills", start:{ date:"2026-01-28" }, end:{ date:"2026-01-29" },
+    recurrence:["RRULE:FREQ=MONTHLY;INTERVAL=1;UNTIL=20261231"]
+  }, context);
+
+  assert.equal(result.supported, true);
+  assert.equal(result.event.recurrence, "monthly");
+  assert.equal(result.event.recurrence_end, "2026-12-31");
+});
+
+test("Google recurrence that cannot preserve Family Hub clamping is read-only", () => {
+  const monthly = googleToFamilyEvent({
+    id:"g3-month-end", summary:"Month end", start:{ date:"2026-01-31" }, end:{ date:"2026-02-01" },
+    recurrence:["RRULE:FREQ=MONTHLY"]
+  }, context);
+  const leapYearly = googleToFamilyEvent({
+    id:"g3-leap", summary:"Leap day", start:{ date:"2024-02-29" }, end:{ date:"2024-03-01" },
+    recurrence:["RRULE:FREQ=YEARLY"]
+  }, context);
+
+  assert.deepEqual(monthly, { supported:false, readOnlyReason:"recurrence_occurrence_mismatch" });
+  assert.deepEqual(leapYearly, { supported:false, readOnlyReason:"recurrence_occurrence_mismatch" });
+});
+
+test("Family recurrence that cannot be represented by a Google RRULE stays local", () => {
+  assert.throws(() => familyToGoogleEvent({
+    title:"Month end", event_date:"2026-01-31", all_day:true, recurrence:"monthly", recurrence_end:null
+  }, context), /cannot preserve Family Hub recurrence occurrences/);
+  assert.throws(() => familyToGoogleEvent({
+    title:"Leap day", event_date:"2024-02-29", all_day:true, recurrence:"yearly", recurrence_end:null
+  }, context), /cannot preserve Family Hub recurrence occurrences/);
+});
+
+test("complex recurrence exceptions are read-only", () => {
+  const result = googleToFamilyEvent({
+    id:"g2", recurringEventId:"series", originalStartTime:{ dateTime:"2026-09-03T18:00:00-04:00" }
+  }, context);
+
+  assert.equal(result.supported, false);
+  assert.equal(result.readOnlyReason, "complex_recurrence_exception");
+});
+
+test("multiple recurrence rules and positional rules are read-only", () => {
+  const multiple = googleToFamilyEvent({
+    id:"g4", start:{ date:"2026-09-01" }, end:{ date:"2026-09-02" },
+    recurrence:["RRULE:FREQ=WEEKLY", "EXDATE;VALUE=DATE:20260908"]
+  }, context);
+  const positional = googleToFamilyEvent({
+    id:"g5", start:{ date:"2026-09-01" }, end:{ date:"2026-09-02" },
+    recurrence:["RRULE:FREQ=MONTHLY;BYSETPOS=1"]
+  }, context);
+
+  assert.deepEqual(multiple, { supported:false, readOnlyReason:"complex_recurrence" });
+  assert.deepEqual(positional, { supported:false, readOnlyReason:"complex_recurrence" });
+});
+
+test("cross-zone recurring events are read-only to preserve daylight-saving wall time", () => {
+  const result = googleToFamilyEvent({
+    id:"g6", summary:"Pacific series",
+    start:{ dateTime:"2026-03-08T09:00:00-07:00", timeZone:"America/Los_Angeles" },
+    end:{ dateTime:"2026-03-08T10:00:00-07:00", timeZone:"America/Los_Angeles" },
+    recurrence:["RRULE:FREQ=WEEKLY"]
+  }, context);
+
+  assert.deepEqual(result, { supported:false, readOnlyReason:"recurring_time_zone_mismatch" });
+});
+
+test("same-zone recurring events remain writable across daylight-saving time", () => {
+  const result = googleToFamilyEvent({
+    id:"g7", summary:"Local series",
+    start:{ dateTime:"2026-03-08T09:00:00-04:00", timeZone:"America/Toronto" },
+    end:{ dateTime:"2026-03-08T10:00:00-04:00", timeZone:"America/Toronto" },
+    recurrence:["RRULE:FREQ=WEEKLY"]
+  }, context);
+
+  assert.equal(result.supported, true);
+  assert.equal(result.event.recurrence, "weekly");
+});
+
+test("a recurring event with mismatched endpoint zones is read-only", () => {
+  const result = googleToFamilyEvent({
+    id:"g7b", summary:"Mixed-zone series",
+    start:{ dateTime:"2026-03-08T09:00:00-04:00", timeZone:"America/Toronto" },
+    end:{ dateTime:"2026-03-08T10:00:00-07:00", timeZone:"America/Los_Angeles" },
+    recurrence:["RRULE:FREQ=WEEKLY"]
+  }, context);
+
+  assert.deepEqual(result, { supported:false, readOnlyReason:"recurring_time_zone_mismatch" });
+});
+
+test("fall-back fold events are read-only when local end time precedes local start time", () => {
+  const result = googleToFamilyEvent({
+    id:"g7c", summary:"Fall-back fold",
+    start:{ dateTime:"2026-11-01T01:45:00-04:00", timeZone:"America/Toronto" },
+    end:{ dateTime:"2026-11-01T01:15:00-05:00", timeZone:"America/Toronto" }
+  }, context);
+
+  assert.deepEqual(result, { supported:false, readOnlyReason:"ambiguous_local_time" });
+});
+
+test("multi-day Google events are read-only because Family Hub has no end date", () => {
+  const allDay = googleToFamilyEvent({
+    id:"g8", start:{ date:"2026-09-01" }, end:{ date:"2026-09-03" }
+  }, context);
+  const timed = googleToFamilyEvent({
+    id:"g9", start:{ dateTime:"2026-09-01T18:00:00-04:00" }, end:{ dateTime:"2026-09-02T01:00:00-04:00" }
+  }, context);
+
+  assert.deepEqual(allDay, { supported:false, readOnlyReason:"multi_day_event" });
+  assert.deepEqual(timed, { supported:false, readOnlyReason:"multi_day_event" });
+});
+
+test("outbound timed events reject an end before their start", () => {
+  assert.throws(() => familyToGoogleEvent({
+    title:"Invalid", event_date:"2026-09-02", start_time:"18:00", end_time:"17:00", all_day:false, recurrence:"none"
+  }, context), /end time must not be earlier than start time/);
+});
+
+test("omitted household zones default to Toronto without shifting a near-midnight event", () => {
+  const defaultContext = { householdId:"h1", defaultPersonId:"p1" };
+  const result = googleToFamilyEvent({
+    id:"g10", start:{ dateTime:"2026-08-27T03:30:00Z" }, end:{ dateTime:"2026-08-27T03:45:00Z" }
+  }, defaultContext);
+  const payload = familyToGoogleEvent({
+    title:"Default zone", event_date:"2026-08-26", start_time:"23:30", end_time:"23:45", all_day:false, recurrence:"none"
+  }, defaultContext);
+
+  assert.equal(result.event.event_date, "2026-08-26");
+  assert.equal(result.event.start_time, "23:30");
+  assert.equal(payload.start.timeZone, "America/Toronto");
+});

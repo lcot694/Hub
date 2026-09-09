@@ -115,19 +115,24 @@
       <form id="eventForm" class="form">
         <label>Event<input id="eventTitle" required></label>
         <label>Family member<select id="eventPerson" required></select></label>
+        <label>Calendar<select id="eventCalendar"></select></label>
+        <label class="check-row"><input id="eventAllDay" type="checkbox"> All-day event</label>
         <div class="quick-row">
           <label>Date<input id="eventDate" type="date" required></label>
-          <label>Time<input id="eventTime" type="time" required></label>
+          <label id="eventTimeWrap">Time<input id="eventTime" type="time" required></label>
         </div>
-        <label>Ends at<input id="eventEndTime" type="time"></label>
+        <label id="eventEndTimeWrap">Ends at<input id="eventEndTime" type="time"></label>
         <label>Repeats
           <select id="eventRepeat">
             <option value="none">Does not repeat</option>
             <option value="daily">Every day</option>
             <option value="weekly">Every week</option>
+            <option value="monthly">Every month</option>
+            <option value="yearly">Every year</option>
           </select>
         </label>
         <label id="repeatEndWrap" class="hidden">Repeat until<input id="eventRepeatEnd" type="date"></label>
+        <div id="eventSyncStatus" class="event-sync-dialog hidden" aria-live="polite"></div>
         <div class="modal-actions">
           <button class="btn" type="button" data-close="eventDialog">Cancel</button>
           <button class="btn primary" type="submit">Save event</button>
@@ -141,9 +146,33 @@
       <h2>Family members</h2>
       <div id="peopleSettings" class="settings-people"></div>
       <button id="addPersonBtn" class="btn wide">+ Add family member</button>
+      <section id="googleSettings" class="google-settings" aria-labelledby="googleSettingsTitle">
+        <h3 id="googleSettingsTitle">Google Calendar</h3>
+        <label>Family member<select id="googlePerson"></select></label>
+        <div id="googleCalendarList" class="google-calendar-list" aria-live="polite"></div>
+        <div id="googlePendingDeletions" class="google-calendar-list" aria-live="polite"></div>
+        <div class="google-settings-actions">
+          <button id="googleConnectBtn" class="btn" type="button">Connect Google Calendar</button>
+          <button id="googleSyncNowBtn" class="btn hidden" type="button">Sync now</button>
+          <button id="googleDisconnectBtn" class="btn danger hidden" type="button">Disconnect</button>
+        </div>
+      </section>
       <div class="modal-actions">
         <button class="btn" type="button" data-close="familyDialog">Close</button>
         <button id="signoutBtn" class="btn danger" type="button">Sign out</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="googleDisconnectDialog" aria-labelledby="googleDisconnectTitle">
+    <div class="modal">
+      <h3 id="googleDisconnectTitle">Disconnect Google Calendar?</h3>
+      <p>Google events will not be deleted. Choose what happens to their Family Hub copies.</p>
+      <p id="googleDisconnectError" class="muted" aria-live="polite"></p>
+      <div class="modal-actions">
+        <button id="googleKeepLocalBtn" class="btn" type="button">Keep Family Hub copies</button>
+        <button id="googleRemoveLocalBtn" class="btn danger" type="button">Remove Family Hub copies</button>
+        <button id="googleDisconnectCancelBtn" class="btn" type="button">Cancel</button>
       </div>
     </div>
   </dialog>
@@ -173,6 +202,6 @@
   </dialog>
 
   <script src="config.js"></script>
-  <script type="module" src="app.js?v=2"></script>
+  <script type="module" src="app.js?v=3"></script>
 </body>
 </html>
