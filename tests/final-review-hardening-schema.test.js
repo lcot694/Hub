@@ -3,11 +3,20 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
 const migrationUrl = new URL("../supabase/migrations/202609080001_google_sync_final_hardening.sql", import.meta.url);
+const initialSyncSchemaUrl = new URL("../supabase/migrations/202608260001_google_sync_schema.sql", import.meta.url);
 const reconnectFenceUrl = new URL("../supabase/migrations/202609080002_google_reconnect_failure_fence.sql", import.meta.url);
 const staleQueueUrl = new URL("../supabase/migrations/202609080003_google_stale_authorization_queue_fix.sql", import.meta.url);
 const staleQueueOrderingUrl = new URL("../supabase/migrations/202609080004_google_stale_authorization_successor_order.sql", import.meta.url);
 
 async function migration() { return await readFile(migrationUrl, "utf8"); }
+
+test("queue helper keeps its original return type during final hardening", async () => {
+  const initial = await readFile(initialSyncSchemaUrl, "utf8");
+  const final = await migration();
+  const signature = /create or replace function public\.enqueue_google_event_change_internal\([\s\S]*?\)\s*returns\s+(\w+)/i;
+  assert.equal(initial.match(signature)?.[1]?.toLowerCase(), "uuid");
+  assert.equal(final.match(signature)?.[1]?.toLowerCase(), "uuid");
+});
 
 test("forward migration adds an authoritative Google-owned Family revision with upgrade backfill", async () => {
   const sql = await migration();

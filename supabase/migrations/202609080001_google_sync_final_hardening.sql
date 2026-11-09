@@ -62,11 +62,11 @@ end $$;
 
 -- Queue insertion is the transactional enforcement point shared by save/delete.
 create or replace function public.enqueue_google_event_change_internal(p_family_event_id uuid,p_operation text)
-returns void language plpgsql security definer set search_path = public as $$
-declare v_mapping public.google_event_mappings%rowtype; v_operation text:=p_operation;
+returns uuid language plpgsql security definer set search_path = public as $$
+declare v_mapping public.google_event_mappings%rowtype; v_operation text:=p_operation; v_queue_id uuid;
 begin
   select * into v_mapping from public.google_event_mappings where family_event_id=p_family_event_id for update;
-  if not found then return; end if;
+  if not found then return null; end if;
   perform public.assert_google_mapping_writable(p_family_event_id);
   if p_operation<>'delete' and exists(select 1 from public.events e where e.id=p_family_event_id and
     ((e.recurrence='monthly' and extract(day from e.event_date)>28)
@@ -77,9 +77,10 @@ begin
   update public.google_sync_queue set status='superseded',updated_at=clock_timestamp()
     where family_event_id=p_family_event_id and status='pending';
   insert into public.google_sync_queue(family_event_id,google_event_mapping_id,operation,status,next_attempt_at)
-  values(p_family_event_id,v_mapping.id,v_operation,'pending',clock_timestamp());
+  values(p_family_event_id,v_mapping.id,v_operation,'pending',clock_timestamp()) returning id into v_queue_id;
   update public.google_event_mappings set sync_state='syncing',safe_error_message=null,updated_at=clock_timestamp()
     where id=v_mapping.id;
+  return v_queue_id;
 end $$;
 
 create or replace function public.load_google_push_context(p_job_id uuid,p_claim_token uuid)
