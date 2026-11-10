@@ -73,8 +73,13 @@ export function createScheduledSyncHandler(dependencies: ScheduledSyncDependenci
       const calendars = await store.listDueCalendars(CALENDAR_BATCH);
       const pull = dependencies.pull ?? ((calendar) => pullCalendar(calendar, store.pullDependencies!));
       let failures = 0;
+      let googleEventsReturned = 0;
       for (const calendar of calendars) {
-        try { await pull(calendar); } catch { failures += 1; }
+        try {
+          const result = await pull(calendar) as { processed?: unknown };
+          const processed = Number(result?.processed);
+          if (Number.isSafeInteger(processed) && processed >= 0) googleEventsReturned += processed;
+        } catch { failures += 1; }
       }
       const jobs = await store.claimJobs(JOB_BATCH, LEASE_SECONDS);
       const push = dependencies.push ?? ((job) => processPushJob(job, store.pushDependencies!));
@@ -83,6 +88,7 @@ export function createScheduledSyncHandler(dependencies: ScheduledSyncDependenci
       }
       return json(200, {
         calendarsProcessed: calendars.length,
+        googleEventsReturned,
         jobsProcessed: jobs.length,
         ...(failures ? { failures } : {}),
         workRemaining: calendars.length === CALENDAR_BATCH || jobs.length === JOB_BATCH,

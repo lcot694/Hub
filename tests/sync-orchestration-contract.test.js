@@ -78,12 +78,12 @@ test("scheduled sync pulls and drains bounded batches including recovered leases
         return [{ id: "pending", claim_token: "a" }, { id: "expired-lease", claim_token: "b", recovered: true }];
       },
     },
-    pull: async (calendar) => { pulled.push(calendar.id); },
+    pull: async (calendar) => { pulled.push(calendar.id); return { processed: 1 }; },
     push: async (job) => { jobs.push(job.id); },
   });
   const response = await handler(new Request("https://project.test/google-sync-scheduled", { method: "POST", headers: { Authorization: "Bearer cron-secret-value" } }));
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { calendarsProcessed: 10, jobsProcessed: 2, workRemaining: true });
+  assert.deepEqual(await response.json(), { calendarsProcessed: 10, googleEventsReturned: 10, jobsProcessed: 2, workRemaining: true });
   assert.equal(pulled.length, 10);
   assert.deepEqual(jobs, ["pending", "expired-lease"]);
 });
@@ -97,14 +97,14 @@ test("scheduled sync isolates pull and push failures so later work still runs", 
       listDueCalendars: async () => [{ id: "pull-fails" }, { id: "pull-runs" }],
       claimJobs: async () => [{ id: "push-fails" }, { id: "push-runs" }],
     },
-    pull: async ({ id }) => { pulled.push(id); if (id === "pull-fails") throw new Error("private pull detail"); },
+    pull: async ({ id }) => { pulled.push(id); if (id === "pull-fails") throw new Error("private pull detail"); return { processed: 2 }; },
     push: async ({ id }) => { pushed.push(id); if (id === "push-fails") throw new Error("private push detail"); },
   })(new Request("https://project.test/google-sync-scheduled", { method: "POST", headers: { Authorization: "Bearer cron-secret" } }));
 
   assert.equal(response.status, 200);
   assert.deepEqual(pulled, ["pull-fails", "pull-runs"]);
   assert.deepEqual(pushed, ["push-fails", "push-runs"]);
-  assert.deepEqual(await response.json(), { calendarsProcessed: 2, jobsProcessed: 2, failures: 2, workRemaining: false });
+  assert.deepEqual(await response.json(), { calendarsProcessed: 2, googleEventsReturned: 2, jobsProcessed: 2, failures: 2, workRemaining: false });
 });
 
 test("production database composition supplies both worker stores and Google adapters", async () => {
