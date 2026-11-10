@@ -52,7 +52,7 @@ export function sanitizeCalendar(calendar: StoredCalendar) {
 
 async function loadOwnedConnection(database: SupabaseClient, userId: string): Promise<StoredConnection | null> {
   const { data, error } = await database.from("google_connections")
-    .select("id,user_id,household_id,person_id,display_email,connection_state,access_token_encrypted,refresh_token_encrypted,token_expires_at")
+    .select("id,user_id,household_id,person_id,display_email,connection_state,access_token_encrypted,refresh_token_encrypted,token_expires_at,google_account_id,oauth_generation")
     .eq("user_id", userId).maybeSingle();
   if (error) throw new HttpError(503, "calendar_unavailable", "Google calendar settings are unavailable");
   if (!data) return null;

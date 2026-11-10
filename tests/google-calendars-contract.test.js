@@ -20,6 +20,7 @@ const CONNECTION = {
   id: "connection-1", user_id: USER_ID, household_id: "household-1", person_id: "person-1",
   display_email: "adult@example.test", connection_state: "active",
   access_token_encrypted: "encrypted-access", refresh_token_encrypted: "encrypted-refresh", token_expires_at: null,
+  google_account_id: "google-account-1", oauth_generation: 1,
 };
 
 function store(overrides = {}) {
@@ -203,12 +204,15 @@ test("owned connection loader validates owned, absent, membership, and household
     { name: "not a member", connection: CONNECTION, member: false, person: true, status: 403 },
     { name: "person in another household", connection: CONNECTION, member: true, person: false, status: 403 },
   ]) {
+    let connectionColumns = "";
     const database = { from(table) {
       const result = table === "google_connections" ? scenario.connection : table === "household_members" ? scenario.member ? {} : null : scenario.person ? {} : null;
-      return { select() { return this; }, eq() { return this; }, maybeSingle() { return Promise.resolve({ data: result, error: null }); } };
+      return { select(columns) { if (table === "google_connections") connectionColumns = columns; return this; }, eq() { return this; }, maybeSingle() { return Promise.resolve({ data: result, error: null }); } };
     } };
     if (scenario.status === undefined) assert.equal(await createOwnedConnectionLoader(database)(USER_ID), scenario.result);
     else await assert.rejects(createOwnedConnectionLoader(database)(USER_ID), (error) => error.status === scenario.status);
+    assert.match(connectionColumns, /google_account_id/);
+    assert.match(connectionColumns, /oauth_generation/);
   }
 });
 
