@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 
 const migration = new URL("../supabase/migrations/202608270002_google_calendar_hardening.sql", import.meta.url);
 const baseMigration = new URL("../supabase/migrations/202608260001_google_sync_schema.sql", import.meta.url);
+const selectionFixMigration = new URL("../supabase/migrations/202611090001_google_calendar_selection_ambiguity_fix.sql", import.meta.url);
 
 test("calendar hardening migration enforces one account and atomically replaces snapshots and selections", async () => {
   const sql = await readFile(migration, "utf8");
@@ -30,4 +31,12 @@ test("contract: PostgreSQL functions keep each snapshot and selection replacemen
   const sql = await readFile(migration, "utf8");
   assert.match(sql, /create or replace function public\.replace_google_calendar_snapshot[\s\S]*language plpgsql[\s\S]*insert into public\.google_calendars[\s\S]*update public\.google_calendars/i);
   assert.match(sql, /create or replace function public\.set_google_calendar_selection[\s\S]*language plpgsql[\s\S]*update public\.google_connections[\s\S]*update public\.google_calendars/i);
+});
+
+test("calendar selection qualifies connection columns that collide with table-return variables", async () => {
+  for (const path of [migration, selectionFixMigration]) {
+    const sql = await readFile(path, "utf8");
+    const selection = sql.match(/create or replace function public\.set_google_calendar_selection[\s\S]*?\n\$\$;/i)?.[0] ?? "";
+    assert.match(selection, /update public\.google_connections\s+c\s+[\s\S]*where c\.id\s*=\s*p_connection_id\s+and c\.user_id\s*=\s*p_user_id/i);
+  }
 });

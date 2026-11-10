@@ -112,9 +112,9 @@ begin
     raise exception 'Google calendar is not available to this user';
   end if;
 
-  update public.google_connections
+  update public.google_connections c
   set person_id = p_person_id, updated_at = clock_timestamp()
-  where id = p_connection_id and user_id = p_user_id;
+  where c.id = p_connection_id and c.user_id = p_user_id;
 
   update public.google_calendars cal
   set enabled = (item->>'enabled')::boolean,
