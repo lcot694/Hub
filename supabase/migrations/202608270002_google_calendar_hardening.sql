@@ -31,8 +31,8 @@ set search_path = public
 as $$
 begin
   if not exists (
-    select 1 from public.google_connections
-    where id = p_connection_id and user_id = p_user_id
+    select 1 from public.google_connections c
+    where c.id = p_connection_id and c.user_id = p_user_id
   ) then
     raise exception 'Google calendar is not available to this user';
   end if;
@@ -143,8 +143,8 @@ set search_path = public
 as $$
 begin
   if not exists (
-    select 1 from public.google_connections
-    where id = p_connection_id and user_id = p_user_id
+    select 1 from public.google_connections c
+    where c.id = p_connection_id and c.user_id = p_user_id
   ) then
     raise exception 'Google calendar is not available to this user';
   end if;

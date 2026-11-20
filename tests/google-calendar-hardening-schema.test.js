@@ -5,6 +5,7 @@ import { readFile } from "node:fs/promises";
 const migration = new URL("../supabase/migrations/202608270002_google_calendar_hardening.sql", import.meta.url);
 const baseMigration = new URL("../supabase/migrations/202608260001_google_sync_schema.sql", import.meta.url);
 const selectionFixMigration = new URL("../supabase/migrations/202611090001_google_calendar_selection_ambiguity_fix.sql", import.meta.url);
+const reconnectFixMigration = new URL("../supabase/migrations/202611200001_google_reconnect_ambiguity_fix.sql", import.meta.url);
 
 test("calendar hardening migration enforces one account and atomically replaces snapshots and selections", async () => {
   const sql = await readFile(migration, "utf8");
@@ -38,5 +39,13 @@ test("calendar selection qualifies connection columns that collide with table-re
     const sql = await readFile(path, "utf8");
     const selection = sql.match(/create or replace function public\.set_google_calendar_selection[\s\S]*?\n\$\$;/i)?.[0] ?? "";
     assert.match(selection, /update public\.google_connections\s+c\s+[\s\S]*where c\.id\s*=\s*p_connection_id\s+and c\.user_id\s*=\s*p_user_id/i);
+  }
+});
+
+test("reconnect transition qualifies connection columns that collide with table-return variables", async () => {
+  for (const path of [migration, reconnectFixMigration]) {
+    const sql = await readFile(path, "utf8");
+    const reconnect = sql.match(/create or replace function public\.mark_google_connection_reconnect_required[\s\S]*?\n\$\$;/i)?.[0] ?? "";
+    assert.match(reconnect, /select 1 from public\.google_connections\s+c[\s\S]*where c\.id\s*=\s*p_connection_id\s+and c\.user_id\s*=\s*p_user_id/i);
   }
 });
